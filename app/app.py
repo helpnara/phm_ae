@@ -27,6 +27,8 @@ if ROOT not in sys.path:
 
 from src.config import load_config
 from src.detector import AnomalyDetector
+from src.data import infer_feature_columns
+from src import eda as EDA
 
 st.set_page_config(page_title="PHM 이상탐지", page_icon="🔧", layout="wide")
 
@@ -38,6 +40,7 @@ def _reset_if_new_upload(uploaded) -> None:
         st.session_state["upload_sig"] = sig
         st.session_state.pop("detector", None)
         st.session_state.pop("train_note", None)
+        st.session_state.pop("show_eda", None)
 
 
 def train_and_store(df: pd.DataFrame, cfg: dict, artifacts_dir: str,
@@ -170,6 +173,111 @@ def render_results(detector: AnomalyDetector, df: pd.DataFrame,
     )
 
 
+def render_eda(df: pd.DataFrame, cfg: dict) -> None:
+    """업로드 데이터의 통계량·EDA 결과를 렌더링한다(학습 전 사전 검토용)."""
+    data_cfg = cfg["data"]
+    exclude = list(data_cfg.get("exclude_columns", []))
+    label_col = data_cfg.get("label_column")
+    ts_col = data_cfg.get("timestamp_column")
+    feature_cols = infer_feature_columns(df, exclude)
+
+    info = EDA.basic_info(df, feature_cols, label_col, ts_col)
+    plot_df = EDA.sample_for_plot(df)
+
+    st.header("🔍 EDA · 데이터 분석 결과")
+
+    # 1) 데이터 개요
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("행(row)", f"{info['n_rows']:,}")
+    c2.metric("열(col)", f"{info['n_cols']:,}")
+    c3.metric("피처 수", f"{info['n_features']:,}")
+    c4.metric("총 결측", f"{info['total_missing']:,}")
+    c5.metric("중복 행", f"{info['n_duplicates']:,}")
+    st.caption(f"메모리 사용량 ≈ {info['memory_mb']:.2f} MB · "
+               f"피처: {', '.join(feature_cols) if feature_cols else '없음'}")
+
+    if not feature_cols:
+        st.error("수치형 피처 컬럼이 없습니다. exclude_columns 설정 또는 데이터를 확인하세요.")
+        return
+
+    # 2) 클래스 분포(라벨 있을 때) — 불균형 확인
+    if info["has_label"]:
+        st.subheader("클래스 분포 (label)")
+        bal = EDA.label_balance(df, label_col)
+        lc1, lc2, lc3 = st.columns([1, 1, 2])
+        lc1.metric("정상(0)", f"{bal['n_normal']:,}")
+        lc2.metric("이상(1)", f"{bal['n_anomaly']:,}")
+        ratio = bal["imbalance_ratio"]
+        lc3.metric("불균형비 (정상:이상)",
+                   "∞ : 1" if ratio == float("inf") else f"{ratio:.1f} : 1")
+        st.caption("불균형 데이터이므로 정확도(accuracy)가 아닌 F1·PR-AUC로 평가합니다.")
+        fig = px.bar(bal["frame"], x="label", y="count", text="count",
+                     color="label", color_discrete_map={"0": "#2c7fb8", "1": "#d7301f"})
+        fig.update_layout(height=280, showlegend=False, xaxis_title="label", yaxis_title="건수")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # 3) 결측치
+    st.subheader("결측치 점검")
+    miss = EDA.missing_frame(df)
+    if len(miss) == 0:
+        st.success("결측치가 없습니다.")
+    else:
+        st.warning(f"결측이 있는 컬럼 {len(miss)}개 — 학습 시 설정된 대치 전략으로 처리됩니다.")
+        st.dataframe(miss, use_container_width=True, hide_index=True)
+
+    # 4) 기초 통계량
+    st.subheader("기초 통계량")
+    desc = EDA.describe_frame(df, feature_cols)
+    st.dataframe(desc.style.format(precision=3), use_container_width=True, hide_index=True)
+
+    # 5) 데이터 품질 — 상수 컬럼 / 이상치(IQR)
+    st.subheader("데이터 품질 점검")
+    const_cols = EDA.constant_columns(df, feature_cols)
+    if const_cols:
+        st.warning(f"상수(분산 0) 컬럼: {const_cols} → 학습 시 자동 제거됩니다.")
+    else:
+        st.caption("상수 컬럼 없음.")
+    out = EDA.outlier_frame(df, feature_cols)
+    st.caption("IQR(1.5×) 기준 피처별 이상치 비율 — 값이 높으면 데이터 오염/센서 이상 가능성.")
+    st.dataframe(out, use_container_width=True, hide_index=True)
+
+    # 6) 분포 (히스토그램)
+    st.subheader("피처 분포")
+    show_feats = feature_cols[:12]
+    if len(feature_cols) > 12:
+        st.caption(f"피처가 많아 상위 12개만 표시합니다(전체 {len(feature_cols)}개).")
+    ncol = 3
+    for i in range(0, len(show_feats), ncol):
+        cols = st.columns(ncol)
+        for j, f in enumerate(show_feats[i:i + ncol]):
+            with cols[j]:
+                h = px.histogram(plot_df, x=f, nbins=40, color_discrete_sequence=["#2c7fb8"])
+                h.update_layout(height=240, margin=dict(l=10, r=10, t=30, b=10),
+                                showlegend=False, title=dict(text=f, font=dict(size=13)))
+                st.plotly_chart(h, use_container_width=True)
+
+    # 7) 상관관계 히트맵
+    corr = EDA.correlation(df, feature_cols)
+    if not corr.empty:
+        st.subheader("피처 상관관계")
+        heat = px.imshow(corr, text_auto=".2f", zmin=-1, zmax=1,
+                         color_continuous_scale="RdBu_r", aspect="auto")
+        heat.update_layout(height=420)
+        st.plotly_chart(heat, use_container_width=True)
+
+    # 8) 시계열 추이 (timestamp 있을 때)
+    if info["has_timestamp"]:
+        st.subheader("시계열 추이")
+        sel = st.selectbox("피처 선택", feature_cols, key="eda_ts_feature")
+        tdf = plot_df[[ts_col, sel]].sort_values(ts_col)
+        line = px.line(tdf, x=ts_col, y=sel)
+        line.update_traces(line_color="#2c7fb8")
+        line.update_layout(height=320)
+        st.plotly_chart(line, use_container_width=True)
+        if len(df) > len(plot_df):
+            st.caption(f"대용량 대비 {len(plot_df):,}건으로 샘플링해 표시(통계량은 전체 기준).")
+
+
 def main() -> None:
     st.title("🔧 PHM 오토인코더 기반 이상탐지")
     st.caption(
@@ -212,24 +320,37 @@ def main() -> None:
         st.error(f"CSV 읽기 실패: {e}")
         st.stop()
 
-    # 미리보기(좌) + 학습 버튼(우)
-    left, right = st.columns([4, 1])
+    # 미리보기(좌) + EDA·학습 버튼(우)
+    left, right = st.columns([4, 1.4])
     with left:
         st.subheader("입력 데이터 미리보기")
         st.dataframe(df.head(), use_container_width=True)
     with right:
         st.markdown("<div style='height:2.2rem'></div>", unsafe_allow_html=True)
-        train_clicked = st.button("🚀 학습", type="primary", use_container_width=True)
-        st.caption(f"행 {len(df):,} · 열 {df.shape[1]}")
+        bcol1, bcol2 = st.columns(2)
+        eda_clicked = bcol1.button("🔍 EDA", use_container_width=True)
+        train_clicked = bcol2.button("🚀 학습", type="primary", use_container_width=True)
+        st.caption(f"행 {len(df):,} · 열 {df.shape[1]}\n\nEDA로 먼저 검토 후 학습을 권장합니다.")
 
+    # EDA는 한 번 켜지면 유지(재실행에도 표시)
+    if eda_clicked:
+        st.session_state["show_eda"] = True
     # 학습 실행
     if train_clicked:
         train_and_store(df, cfg, artifacts_dir, label_col)
 
-    # 학습 완료 시 결과 표시
+    # ---- EDA 결과 ----
+    if st.session_state.get("show_eda"):
+        st.divider()
+        render_eda(df, cfg)
+
+    # ---- 학습 결과 ----
     detector = st.session_state.get("detector")
     if detector is None:
-        st.info("오른쪽 **'학습'** 버튼을 눌러 학습을 시작하세요.")
+        if not st.session_state.get("show_eda"):
+            st.info("**'EDA'** 로 데이터를 먼저 검토하거나, **'학습'** 버튼으로 바로 학습을 시작하세요.")
+        else:
+            st.info("EDA 검토 후 **'학습'** 버튼을 눌러 학습을 시작하세요.")
         st.stop()
 
     st.divider()
