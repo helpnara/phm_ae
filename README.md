@@ -6,6 +6,18 @@
 
 CSV를 업로드하면 **웹(Streamlit)** 에서 이상 여부를 테스트할 수 있다.
 
+## 웹 데모 배포 (원클릭)
+
+아래 배지를 누르면 **Streamlit Community Cloud**에 이 저장소를 배포해 공개 웹 링크를
+만들 수 있다. GitHub 로그인 후 저장소/브랜치/`app/app.py`가 자동 입력되며,
+아티팩트가 없으면 최초 실행 시 합성 데이터로 자동 학습한다(별도 모델 커밋 불필요).
+
+[![Streamlit 배포](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io/deploy?repository=helpnara/phm_ae&branch=claude/phm-autoencoder-anomaly-3uz6eh&mainModule=app/app.py)
+
+> 생성되는 링크 형태: `https://<앱이름>.streamlit.app`
+> 사내 실데이터/Oracle 연동 서비스는 보안상 **사내 서버 배포**가 맞다
+> (`docs/migration_notes.md §7`). 위 데모 링크는 합성 데이터 기반 공유용이다.
+
 - 요구사항 정의서: [`docs/requirements.md`](docs/requirements.md)
 - 사내 서버·DB 이식 노트: [`docs/migration_notes.md`](docs/migration_notes.md)
 - 개발 가이드: [`CLAUDE.md`](CLAUDE.md)
