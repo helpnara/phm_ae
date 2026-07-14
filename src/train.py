@@ -29,7 +29,8 @@ def set_seeds(seed: int) -> None:
     tf.random.set_seed(seed)
 
 
-def train(data_path: str, config_path: str | None = None) -> str:
+def train(data_path: str | None = None, config_path: str | None = None,
+          sql: str | None = None) -> str:
     import tensorflow as tf
     from tensorflow import keras
 
@@ -38,7 +39,8 @@ def train(data_path: str, config_path: str | None = None) -> str:
     set_seeds(seed)
 
     # 1) 데이터 로드 및 전처리(스케일러/스키마 fit)
-    df = D.load_csv(data_path)
+    #    CSV(--data) 또는 Oracle 조회(--sql) 중 하나. 정상 데이터만 사용해야 함.
+    df = D.load_dataframe(csv_path=data_path, sql=sql)
     X, schema, scaler = D.fit_preprocess(df, cfg)
     n_features = X.shape[1]
     print(f"[train] 샘플 {X.shape[0]}개, 피처 {n_features}개: {schema.feature_columns}")
@@ -82,7 +84,7 @@ def train(data_path: str, config_path: str | None = None) -> str:
 
     meta = {
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "data_path": os.path.abspath(data_path),
+        "data_source": os.path.abspath(data_path) if data_path else f"SQL: {sql}",
         "n_samples": int(X.shape[0]),
         "n_features": int(n_features),
         "seed": seed,
@@ -99,10 +101,12 @@ def train(data_path: str, config_path: str | None = None) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="PHM 오토인코더 학습")
-    ap.add_argument("--data", required=True, help="정상 데이터 CSV 경로")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--data", help="정상 데이터 CSV 경로")
+    src.add_argument("--sql", help="정상 데이터 조회 SQL (Oracle). --data 대신 사용")
     ap.add_argument("--config", default=None, help="설정 YAML 경로")
     args = ap.parse_args()
-    train(args.data, args.config)
+    train(data_path=args.data, config_path=args.config, sql=args.sql)
 
 
 if __name__ == "__main__":

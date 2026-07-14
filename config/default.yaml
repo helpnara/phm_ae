@@ -38,3 +38,13 @@ threshold:
 
 paths:
   artifacts_dir: "artifacts"
+
+# 사내 DB(Oracle) 연동 설정 (선택). 로컬/합성 테스트에는 사용 안 함.
+# 접속정보(계정/비번/DSN)는 여기에 넣지 말고 환경변수로 주입한다:
+#   PHM_DB_USER, PHM_DB_PASSWORD, PHM_DB_DSN  (docs/migration_notes.md §1~2 참고)
+database:
+  enabled: false
+  # 정상 데이터 조회 쿼리(학습용). 실제 테이블/컬럼명에 맞게 수정.
+  normal_query: "SELECT * FROM PHM_SENSOR WHERE STATUS = 'NORMAL'"
+  # 배치 추론 결과 적재 테이블
+  result_table: "PHM_ANOMALY_RESULT"

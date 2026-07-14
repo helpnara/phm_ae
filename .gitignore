@@ -17,3 +17,6 @@ env/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 시크릿 / 접속정보 (실값 커밋 금지, .env.example만 커밋)
+.env

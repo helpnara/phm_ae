@@ -47,6 +47,22 @@ def load_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def load_dataframe(csv_path: Optional[str] = None, sql: Optional[str] = None) -> pd.DataFrame:
+    """데이터 소스 추상화: CSV 경로 또는 Oracle SQL 중 하나로 DataFrame을 얻는다.
+
+    사내 이식 시 CSV 대신 sql을 넘기면 DB에서 조회한다(src/db.py 사용).
+    이후 전처리/모델/추론 코드는 DataFrame 형태만 맞으면 수정 불필요.
+    """
+    if csv_path and sql:
+        raise ValueError("csv_path와 sql 중 하나만 지정하세요.")
+    if csv_path:
+        return load_csv(csv_path)
+    if sql:
+        from src.db import read_sql  # 지연 import (DB 의존성은 선택)
+        return read_sql(sql)
+    raise ValueError("csv_path 또는 sql 중 하나는 반드시 필요합니다.")
+
+
 def infer_feature_columns(df: pd.DataFrame, exclude_columns: List[str]) -> List[str]:
     """제외 컬럼을 뺀 수치형 컬럼을 피처로 추론한다."""
     features = []
