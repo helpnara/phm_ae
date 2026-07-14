@@ -29,6 +29,18 @@ st.set_page_config(page_title="PHM 이상탐지", page_icon="🔧", layout="wide
 
 @st.cache_resource(show_spinner="모델 아티팩트 로딩 중...")
 def get_detector(artifacts_dir: str) -> AnomalyDetector:
+    """아티팩트가 없으면 데모용으로 합성 데이터를 생성·학습한 뒤 로드한다.
+
+    이 자동 부트스트랩 덕분에 저장소만으로도(모델 파일 커밋 없이) 어디서나 실행/배포된다.
+    사내 실데이터 학습 시에는 `python -m src.train`으로 미리 아티팩트를 만들어 두면 된다.
+    """
+    if not os.path.exists(os.path.join(artifacts_dir, "model.keras")):
+        from src.generate_synthetic import generate
+        from src.train import train
+        with st.spinner("최초 실행: 데모용 합성 데이터로 모델을 학습 중입니다(1~2분 소요)..."):
+            os.makedirs("data", exist_ok=True)
+            generate(n_normal=3000, n_test=600, anomaly_ratio=0.1, out_dir="data", seed=42)
+            train(data_path="data/normal.csv")
     return AnomalyDetector(artifacts_dir)
 
 
@@ -42,19 +54,20 @@ def main() -> None:
     cfg = load_config()
     artifacts_dir = cfg["paths"]["artifacts_dir"]
 
-    if not os.path.exists(os.path.join(artifacts_dir, "model.keras")):
-        st.error(
-            f"학습된 모델이 없습니다. 먼저 학습을 실행하세요.\n\n"
-            f"```\npython -m src.generate_synthetic\n"
-            f"python -m src.train --data data/normal.csv\n```"
-        )
-        st.stop()
-
+    # 아티팩트가 없으면 데모용 합성 데이터로 자동 학습 후 로드
     detector = get_detector(artifacts_dir)
 
     # ---- 사이드바 ----
     with st.sidebar:
         st.header("설정")
+        # 데모: 업로드할 샘플 CSV 다운로드 (자기 파일이 없는 방문자용)
+        sample_path = os.path.join("data", "test.csv")
+        if os.path.exists(sample_path):
+            with open(sample_path, "rb") as fp:
+                st.download_button("샘플 test.csv 내려받기", data=fp.read(),
+                                   file_name="sample_test.csv", mime="text/csv")
+            st.caption("내려받은 파일을 아래 업로드 칸에 넣어 바로 테스트할 수 있습니다.")
+            st.divider()
         default_thr = detector.threshold
         st.write(f"저장된 임계값: **{default_thr:.6f}**")
         st.caption(f"방식: {detector.threshold_detail.get('method')}")

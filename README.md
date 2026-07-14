@@ -29,6 +29,25 @@ streamlit run app/app.py
 웹앱에서 `data/test.csv`(라벨 포함)를 업로드하면 판정 결과와 함께
 Precision/Recall/F1/PR-AUC 평가지표가 표시된다.
 
+## 실행 화면
+
+`data/test.csv`(정상 360 + 이상 40)를 업로드해 판정한 실제 화면.
+
+**판정 개요** — 업로드·스키마 검증·전체 400건 중 47건 이상 탐지
+![판정 개요](docs/screenshots/01_overview.png)
+
+**재구성 오차** — 정상(파란 점)은 임계값 부근, 이상(빨간 X)은 임계값 위로 크게 이탈
+![재구성 오차](docs/screenshots/02_reconstruction_error.png)
+
+**평가지표** — Precision 0.851 / Recall 1.000 / F1 0.920 / PR-AUC 0.999, 혼동행렬 포함
+![평가지표](docs/screenshots/03_metrics.png)
+
+**이상 원인 피처** — 피처별 재구성 오차 기여도(어느 센서가 이상인지)
+![이상 원인 피처](docs/screenshots/04_feature_importance.png)
+
+**샘플별 결과표** — 오차·점수·판정·최다기여피처, CSV 다운로드
+![샘플별 결과표](docs/screenshots/05_result_table.png)
+
 ## 동작 개요
 
 ```
