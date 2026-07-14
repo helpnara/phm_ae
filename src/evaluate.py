@@ -38,3 +38,25 @@ def compute_metrics(
     cm = confusion_matrix(y_true, predictions, labels=[0, 1])
     metrics["confusion_matrix"] = cm.tolist()  # [[TN, FP], [FN, TP]]
     return metrics
+
+
+def roc_curve_points(y_true: np.ndarray, scores: np.ndarray) -> Optional[Dict[str, Any]]:
+    """ROC 커브 좌표(fpr, tpr)와 AUC. 양·음 클래스가 모두 있어야 계산."""
+    from sklearn.metrics import roc_curve, roc_auc_score
+    y_true = np.asarray(y_true).astype(int)
+    if len(np.unique(y_true)) < 2:
+        return None
+    fpr, tpr, _ = roc_curve(y_true, scores)
+    return {"fpr": fpr.tolist(), "tpr": tpr.tolist(),
+            "auc": float(roc_auc_score(y_true, scores))}
+
+
+def pr_curve_points(y_true: np.ndarray, scores: np.ndarray) -> Optional[Dict[str, Any]]:
+    """Precision-Recall 커브 좌표와 AP(=PR-AUC). 불균형에 강건한 평가."""
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+    y_true = np.asarray(y_true).astype(int)
+    if len(np.unique(y_true)) < 2:
+        return None
+    precision, recall, _ = precision_recall_curve(y_true, scores)
+    return {"precision": precision.tolist(), "recall": recall.tolist(),
+            "ap": float(average_precision_score(y_true, scores))}

@@ -103,6 +103,15 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
         "tensorflow": tf.__version__,
     }
     D.save_artifacts(artifacts_dir, schema, scaler, threshold, meta)
+
+    # 학습 이력 저장(에폭별 손실곡선 시각화용)
+    import json
+    with open(os.path.join(artifacts_dir, "history.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "loss": [float(v) for v in history.history.get("loss", [])],
+            "val_loss": [float(v) for v in history.history.get("val_loss", [])],
+        }, f)
+
     if verbose:
         print(f"[train] 아티팩트 저장 완료: {os.path.abspath(artifacts_dir)}")
     return artifacts_dir

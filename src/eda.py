@@ -108,6 +108,32 @@ def correlation(df: pd.DataFrame, feature_cols: List[str]) -> pd.DataFrame:
     return df[feature_cols].corr()
 
 
+def contamination_warnings(df: pd.DataFrame, feature_cols: List[str],
+                           label_col: Optional[str], pct_threshold: float = 8.0
+                           ) -> List[str]:
+    """학습에 쓸 '정상' 데이터의 오염 가능성을 점검한다.
+
+    정상(label=0, 없으면 전체)에서 IQR 이상치 비율이 임계(기본 8%)를 넘는 피처를
+    경고로 반환한다. 정상 순수성 원칙(학습 데이터에 이상 혼입 방지)을 지원.
+    """
+    if label_col and label_col in df.columns:
+        normal = df[df[label_col] == 0]
+    else:
+        normal = df
+    warns: List[str] = []
+    for c in feature_cols:
+        s = normal[c].dropna()
+        if len(s) == 0:
+            continue
+        q1, q3 = s.quantile(0.25), s.quantile(0.75)
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        pct = ((s < lo) | (s > hi)).mean() * 100
+        if pct >= pct_threshold:
+            warns.append(f"{c}: 정상 데이터 내 이상치 {pct:.1f}%")
+    return warns
+
+
 def sample_for_plot(df: pd.DataFrame, max_rows: int = 5000, seed: int = 42) -> pd.DataFrame:
     """대용량 대비 시각화용 다운샘플(통계량은 전체 사용, 플롯만 샘플)."""
     if len(df) <= max_rows:
