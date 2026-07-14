@@ -46,3 +46,25 @@ def build_autoencoder(n_features: int, cfg: Dict[str, Any]) -> keras.Model:
 
     model = keras.Model(inputs, outputs, name="phm_autoencoder")
     return model
+
+
+def build_lstm_autoencoder(n_features: int, window: int, cfg: Dict[str, Any]) -> keras.Model:
+    """시계열 윈도우 오토인코더(LSTM-AE).
+
+    입력: (window, n_features) 시퀀스. 인코더 LSTM으로 압축 후 RepeatVector로
+    시퀀스를 재생성하고 디코더 LSTM + TimeDistributed Dense로 복원한다.
+    시간 의존성이 중요한 데이터에서 행 단위 Dense AE보다 정상 패턴을 잘 학습한다.
+    """
+    m_cfg = cfg["model"]
+    latent = int(m_cfg.get("bottleneck", 8))
+    hidden = int(list(m_cfg.get("hidden_layers", [32]))[0])
+
+    inputs = keras.Input(shape=(window, n_features), name="seq_input")
+    x = layers.LSTM(hidden, activation="tanh", return_sequences=True, name="enc_lstm1")(inputs)
+    x = layers.LSTM(latent, activation="tanh", return_sequences=False, name="enc_lstm2")(x)
+    x = layers.RepeatVector(window, name="repeat")(x)
+    x = layers.LSTM(latent, activation="tanh", return_sequences=True, name="dec_lstm1")(x)
+    x = layers.LSTM(hidden, activation="tanh", return_sequences=True, name="dec_lstm2")(x)
+    outputs = layers.TimeDistributed(layers.Dense(n_features), name="seq_output")(x)
+
+    return keras.Model(inputs, outputs, name="phm_lstm_autoencoder")

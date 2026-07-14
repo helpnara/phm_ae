@@ -31,27 +31,39 @@ def set_seeds(seed: int) -> None:
 
 def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
                          extra_callbacks: list | None = None, verbose: int = 2,
-                         data_source: str = "dataframe") -> str:
+                         data_source: str = "dataframe",
+                         model_type: str = "dense", window: int | None = None) -> str:
     """DataFrame(정상 데이터)으로 AE를 학습하고 아티팩트를 저장한다.
 
-    CLI와 웹앱이 공통으로 사용한다. extra_callbacks로 Keras 콜백(예: 진행률 표시)을
-    주입할 수 있고, artifacts_dir로 저장 위치를 지정할 수 있다(멀티 유저 격리 등).
+    model_type: "dense"(행 단위) 또는 "lstm"(시계열 윈도우). lstm이면 window 필요.
+    CLI와 웹앱이 공통으로 사용한다.
     """
     import tensorflow as tf
     from tensorflow import keras
+    from src.model import build_lstm_autoencoder
+    from src.scoring import seq_window_errors
+    from src.windowing import make_windows
 
     seed = int(cfg.get("seed", 42))
     set_seeds(seed)
+    t_cfg = cfg["train"]
 
     # 1) 전처리(스케일러/스키마 fit) — 정상 데이터에서만
     X, schema, scaler = D.fit_preprocess(df, cfg)
     n_features = X.shape[1]
     if verbose:
-        print(f"[train] 샘플 {X.shape[0]}개, 피처 {n_features}개: {schema.feature_columns}")
+        print(f"[train] 샘플 {X.shape[0]}개, 피처 {n_features}개, model={model_type}")
 
-    # 2) 모델 구성 및 컴파일
-    model = build_autoencoder(n_features, cfg)
-    t_cfg = cfg["train"]
+    # 2~4) 모델 구성/학습/임계값 — dense vs lstm
+    if model_type == "lstm":
+        window = int(window or 20)
+        Xw = make_windows(X, window)                     # (nw, W, F)
+        model = build_lstm_autoencoder(n_features, window, cfg)
+        fit_x = Xw
+    else:
+        model = build_autoencoder(n_features, cfg)
+        fit_x = X
+
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=float(t_cfg["learning_rate"])),
         loss="mse",
@@ -59,7 +71,6 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
     if verbose:
         model.summary()
 
-    # 3) 학습 (입력=출력=정상 데이터)
     callbacks = [
         keras.callbacks.EarlyStopping(
             monitor="val_loss",
@@ -70,7 +81,7 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
     if extra_callbacks:
         callbacks.extend(extra_callbacks)
     history = model.fit(
-        X, X,
+        fit_x, fit_x,
         validation_split=float(t_cfg["validation_split"]),
         epochs=int(t_cfg["epochs"]),
         batch_size=int(t_cfg["batch_size"]),
@@ -78,9 +89,13 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
         verbose=verbose,
     )
 
-    # 4) 임계값 산출(정상 데이터 재구성 오차 분포)
-    X_hat = model.predict(X, verbose=0)
-    errors = reconstruction_error(X, X_hat)
+    # 임계값 산출(정상 데이터 재구성 오차 분포)
+    if model_type == "lstm":
+        Xw_hat = model.predict(fit_x, verbose=0)
+        errors, _ = seq_window_errors(fit_x, Xw_hat)
+    else:
+        X_hat = model.predict(X, verbose=0)
+        errors = reconstruction_error(X, X_hat)
     threshold = compute_threshold(errors, cfg)
     if verbose:
         print(f"[train] 임계값({threshold['method']}) = {threshold['value']:.6f}")
@@ -93,6 +108,8 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
     meta = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "data_source": data_source,
+        "model_type": model_type,
+        "window": int(window) if model_type == "lstm" else None,
         "n_samples": int(X.shape[0]),
         "n_features": int(n_features),
         "seed": seed,

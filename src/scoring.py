@@ -16,6 +16,14 @@ def reconstruction_error(X: np.ndarray, X_hat: np.ndarray) -> np.ndarray:
     return per_feature_squared_error(X, X_hat).mean(axis=1)
 
 
+def seq_window_errors(Xw: np.ndarray, Xw_hat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """시퀀스 재구성 오차. (n_windows,) 윈도우 오차와 (n_windows, F) 피처별 오차."""
+    se = np.square(Xw - Xw_hat)          # (nw, W, F)
+    win_err = se.mean(axis=(1, 2))       # (nw,)
+    per_feature = se.mean(axis=1)        # (nw, F)
+    return win_err, per_feature
+
+
 def compute_threshold(errors: np.ndarray, cfg: Dict[str, Any]) -> Dict[str, Any]:
     """정상 데이터 재구성 오차 분포로부터 임계값을 산출한다.
 

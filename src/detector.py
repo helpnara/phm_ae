@@ -66,13 +66,28 @@ class AnomalyDetector:
         self.threshold_detail = D.load_threshold(artifacts_dir)
         self.threshold = float(self.threshold_detail["value"])
         self.model = keras.models.load_model(os.path.join(artifacts_dir, D.MODEL_FILE))
+        meta = D.load_meta(artifacts_dir)
+        self.model_type = meta.get("model_type", "dense")
+        self.window = meta.get("window")
 
     def predict(self, df: pd.DataFrame, threshold: Optional[float] = None) -> DetectionResult:
         """DataFrame을 판정한다. threshold를 주면 저장값 대신 사용(인터랙티브)."""
         X = D.validate_and_transform(df, self.schema, self.scaler)
-        X_hat = self.model.predict(X, verbose=0)
-        errors = reconstruction_error(X, X_hat)
-        pfe = per_feature_squared_error(X, X_hat)
+        if self.model_type == "lstm":
+            from src.scoring import seq_window_errors
+            from src.windowing import make_windows, map_windows_to_rows
+            window = int(self.window or 20)
+            if X.shape[0] < window:
+                raise ValueError(f"시계열 모델은 최소 {window}행이 필요합니다(현재 {X.shape[0]}행).")
+            Xw = make_windows(X, window)
+            Xw_hat = self.model.predict(Xw, verbose=0)
+            win_err, win_pfe = seq_window_errors(Xw, Xw_hat)
+            errors = map_windows_to_rows(win_err, X.shape[0], window)
+            pfe = map_windows_to_rows(win_pfe, X.shape[0], window)
+        else:
+            X_hat = self.model.predict(X, verbose=0)
+            errors = reconstruction_error(X, X_hat)
+            pfe = per_feature_squared_error(X, X_hat)
         thr = float(threshold) if threshold is not None else self.threshold
         preds = (errors >= thr).astype(int)
         return DetectionResult(

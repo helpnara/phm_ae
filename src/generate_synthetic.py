@@ -76,6 +76,45 @@ def generate(n_normal: int, n_test: int, anomaly_ratio: float, out_dir: str, see
     print(f"[gen] 테스트 데이터: {test_path} ({n_test} rows, 이상 {n_anom}개)")
 
 
+def generate_timeseries(n: int, anomaly_ratio: float, out_path: str, seed: int) -> None:
+    """시간 의존성(AR(1) 자기상관)이 강한 시계열 데이터를 생성한다(라벨 포함).
+
+    이상은 여러 구간의 '지속적 수준 이동'(contextual anomaly)으로 주입한다 →
+    시계열 윈도우 모델(LSTM-AE)이 행 단위 모델보다 유리한 데이터.
+    """
+    rng = np.random.default_rng(seed)
+    phi = np.array([0.92, 0.90, 0.88, 0.90, 0.85])  # 자기상관 계수(1에 가까울수록 강함)
+
+    def ar1(m: int) -> np.ndarray:
+        x = np.zeros((m, len(SENSORS)))
+        x[0] = NORMAL_MEAN
+        eps = rng.standard_normal((m, len(SENSORS))) * NORMAL_STD * np.sqrt(1 - phi ** 2)
+        for t in range(1, m):
+            x[t] = NORMAL_MEAN + phi * (x[t - 1] - NORMAL_MEAN) + eps[t]
+        return x
+
+    X = ar1(n)
+    y = np.zeros(n, dtype=int)
+
+    # 이상 구간 주입(지속적 수준 이동)
+    target = int(n * anomaly_ratio)
+    injected = 0
+    while injected < target:
+        L = int(rng.integers(5, 16))
+        start = int(rng.integers(0, n - L))
+        j = int(rng.integers(0, len(SENSORS)))
+        X[start:start + L, j] += rng.choice([-1, 1]) * NORMAL_STD[j] * rng.uniform(4, 7)
+        y[start:start + L] = 1
+        injected = int(y.sum())
+
+    ts = pd.date_range("2026-03-01", periods=n, freq="min")
+    df = pd.DataFrame(X, columns=SENSORS)
+    df.insert(0, "timestamp", ts)
+    df["label"] = y
+    df.to_csv(out_path, index=False)
+    print(f"[gen] 시계열 데이터: {out_path} ({n} rows, 이상 {int(y.sum())})")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="합성 PHM 데이터 생성")
     ap.add_argument("--n-normal", type=int, default=5000)
@@ -83,8 +122,14 @@ def main() -> None:
     ap.add_argument("--anomaly-ratio", type=float, default=0.1)
     ap.add_argument("--out-dir", default="data")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--timeseries", metavar="PATH",
+                    help="시계열(AR1) 데이터를 지정 경로에 생성")
+    ap.add_argument("--n", type=int, default=800, help="--timeseries 행 수")
     args = ap.parse_args()
-    generate(args.n_normal, args.n_test, args.anomaly_ratio, args.out_dir, args.seed)
+    if args.timeseries:
+        generate_timeseries(args.n, args.anomaly_ratio, args.timeseries, args.seed)
+    else:
+        generate(args.n_normal, args.n_test, args.anomaly_ratio, args.out_dir, args.seed)
 
 
 if __name__ == "__main__":

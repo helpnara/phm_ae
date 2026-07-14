@@ -134,6 +134,38 @@ def contamination_warnings(df: pd.DataFrame, feature_cols: List[str],
     return warns
 
 
+def time_dependency(df: pd.DataFrame, feature_cols: List[str],
+                    timestamp_col: Optional[str], recommend_threshold: float = 0.3
+                    ) -> Dict[str, Any]:
+    """시간 의존성(자기상관)을 진단해 시계열 윈도우 모델 필요 여부를 판단한다.
+
+    시간순 정렬 후 피처별 lag-1/lag-5 자기상관(ACF)의 평균 절댓값을 계산한다.
+    평균이 임계(기본 0.3) 이상이면 LSTM-AE(시계열 윈도우) 사용을 권장한다.
+    """
+    work = df
+    if timestamp_col and timestamp_col in df.columns:
+        work = df.sort_values(timestamp_col)
+
+    rows = []
+    for c in feature_cols:
+        s = work[c].astype(float).reset_index(drop=True)
+        acf1 = s.autocorr(lag=1)
+        acf5 = s.autocorr(lag=5) if len(s) > 5 else np.nan
+        rows.append({
+            "feature": c,
+            "acf_lag1": float(acf1) if pd.notna(acf1) else 0.0,
+            "acf_lag5": float(acf5) if pd.notna(acf5) else 0.0,
+        })
+    frame = pd.DataFrame(rows)
+    mean_abs_acf1 = float(frame["acf_lag1"].abs().mean()) if len(frame) else 0.0
+    return {
+        "frame": frame,
+        "mean_abs_acf1": mean_abs_acf1,
+        "recommend": mean_abs_acf1 >= recommend_threshold,
+        "threshold": recommend_threshold,
+    }
+
+
 def sample_for_plot(df: pd.DataFrame, max_rows: int = 5000, seed: int = 42) -> pd.DataFrame:
     """대용량 대비 시각화용 다운샘플(통계량은 전체 사용, 플롯만 샘플)."""
     if len(df) <= max_rows:
