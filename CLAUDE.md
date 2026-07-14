@@ -46,15 +46,16 @@ phm_ae/
 
 > 현재 상태: 요구사항 정의서와 본 가이드 문서만 존재. 코드는 마일스톤(M1~M6)에 따라 추가.
 
-## 기술 스택 (기본값)
+## 기술 스택 (확정)
 
 - Python 3.10+
-- TensorFlow/Keras (또는 PyTorch — 하나로 고정)
+- **TensorFlow/Keras** (AE 구현)
 - pandas, numpy, scikit-learn
-- 웹: Streamlit(빠른 테스트) 또는 FastAPI+프론트(확장)
+- **Streamlit** (웹 업로드·판정·시각화)
 - 시각화: matplotlib/plotly
+- 데이터 형태: **행 단위(tabular) — Dense Autoencoder**
 
-프레임워크·웹 스택은 `docs/requirements.md` §14 "열린 결정사항"에서 확정한다. 임의로 바꾸지 말고 확정된 선택을 따른다.
+> 위 선택은 `docs/requirements.md` §14.1에서 확정됨. 임의로 바꾸지 말 것.
 
 ## 개발 워크플로 규칙
 
@@ -70,9 +71,8 @@ phm_ae/
 # 예정: 학습
 # python -m src.train --config config/default.yaml
 
-# 예정: 웹 앱
-# streamlit run app/app.py     (Streamlit 채택 시)
-# 또는 uvicorn app.main:app    (FastAPI 채택 시)
+# 예정: 웹 앱 (Streamlit)
+# streamlit run app/app.py
 ```
 
 ## 참고
