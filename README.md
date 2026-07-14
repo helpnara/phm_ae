@@ -18,6 +18,16 @@ CSV를 업로드하면 **웹(Streamlit)** 에서 이상 여부를 테스트할 �
 > 사내 실데이터/Oracle 연동 서비스는 보안상 **사내 서버 배포**가 맞다
 > (`docs/migration_notes.md §7`). 위 데모 링크는 합성 데이터 기반 공유용이다.
 
+**배포 시 의존성 관련 주의 ("Error during processing dependencies!" 방지):**
+- `requirements.txt`는 클라우드 친화적으로 구성돼 있다 — `tensorflow-cpu`(CUDA 미포함,
+  가벼움) + **상한 핀 없음**(호스트 Python 버전에 맞는 휠을 pip가 선택).
+- Oracle 연동 의존성(`oracledb`, `SQLAlchemy`)은 데모에 불필요하므로 `requirements-db.txt`로
+  **분리**했다. 클라우드 데모는 이를 설치하지 않는다.
+- 클린 venv(Python 3.11)에서 설치·학습·추론·앱 구동까지 검증 완료
+  (tensorflow-cpu 2.21, keras 3.15, numpy 2.x, pandas 3.x).
+- 혹시 배포 환경 Python이 특정 패키지와 안 맞으면, Streamlit Cloud **Advanced settings에서
+  Python 3.12**를 선택하면 가장 호환성이 넓다.
+
 - 요구사항 정의서: [`docs/requirements.md`](docs/requirements.md)
 - 사내 서버·DB 이식 노트: [`docs/migration_notes.md`](docs/migration_notes.md)
 - 개발 가이드: [`CLAUDE.md`](CLAUDE.md)

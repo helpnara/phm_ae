@@ -79,9 +79,12 @@ DB 접속정보, 경로 등은 코드가 아닌 **환경변수/시크릿**으로
   - CPU만 있으면 CPU 빌드로 충분(추론은 가볍다).
   - Python/OS에 맞는 wheel 확보 필요(버전 핀은 `requirements.txt` 참고).
   - TF 설치가 어려우면 추론 전용으로 **ONNX/TFLite 변환** 또는 PyTorch 대체 검토(설계 변경 필요).
-- **Oracle 드라이버**: `oracledb`(python-oracledb) + `SQLAlchemy`. 둘 다 requirements.txt의
-  "사내 DB(선택)" 항목에 있음. thin 모드는 순수 파이썬에 가까워 오프라인 설치도 용이.
-  Instant Client는 thick 모드에서만 필요(§1).
+- **Oracle 드라이버**: `oracledb`(python-oracledb) + `SQLAlchemy`. **`requirements-db.txt`로
+  분리**되어 있음(클라우드 데모 의존성과 격리). 사내 이식 시:
+  `pip install -r requirements.txt -r requirements-db.txt`.
+  thin 모드는 순수 파이썬에 가까워 오프라인 설치도 용이. Instant Client는 thick 모드에서만 필요(§1).
+- **TensorFlow**: 기본 `requirements.txt`는 `tensorflow-cpu`를 사용(추론/소형 AE에 충분, 설치 가벼움).
+  사내에 GPU가 있고 학습 가속이 필요하면 `tensorflow[and-cuda]`로 교체.
 
 ---
 
@@ -168,7 +171,7 @@ CREATE TABLE PHM_ANOMALY_RESULT (
 ## 10. 이식 체크리스트 요약
 - [x] `src/db.py` Oracle 어댑터 (스켈레톤 포함) — 실쿼리/테이블명만 확정
 - [x] `load_dataframe` 로 CSV/Oracle 추상화, `train.py --sql` 지원
-- [x] `oracledb` + `SQLAlchemy` 드라이버 requirements.txt 등록
+- [x] `oracledb` + `SQLAlchemy` 드라이버 `requirements-db.txt`로 분리 등록
 - [ ] Oracle 접속정보 환경변수화 (`PHM_DB_USER/PASSWORD/DSN`, 커밋 금지)
 - [ ] `config.database.normal_query` / `result_table`를 실제 테이블·컬럼으로 수정
 - [ ] thin/thick 모드 결정 (필요 시 Instant Client 경로 설정)
