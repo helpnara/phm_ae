@@ -1,0 +1,40 @@
+# PHM 오토인코더 이상탐지 설정 파일
+# 모든 값은 학습/추론 시 이 파일에서 읽는다. 하드코딩 금지.
+
+seed: 42
+
+data:
+  # 피처에서 제외할 컬럼(존재할 경우). 시간/라벨/식별자 등.
+  exclude_columns: ["timestamp", "label", "id"]
+  # 라벨 컬럼명(선택). 존재하면 평가(FR-7)에 사용. 0=정상, 1=이상.
+  label_column: "label"
+  # 시간 컬럼명(선택). 존재하면 시각화 x축에 사용.
+  timestamp_column: "timestamp"
+  # 결측 대치: median | mean | drop
+  impute_strategy: "median"
+  # 분산 0(상수) 컬럼 제거 여부
+  drop_constant_columns: true
+
+model:
+  # 인코더 은닉층 크기(병목 이전). 디코더는 대칭으로 자동 구성.
+  hidden_layers: [32, 16]
+  bottleneck: 8
+  activation: "relu"
+  dropout: 0.0
+  l2: 0.0
+
+train:
+  validation_split: 0.1
+  epochs: 100
+  batch_size: 64
+  learning_rate: 0.001
+  early_stopping_patience: 10
+
+threshold:
+  # percentile: 정상 재구성 오차의 백분위수 / mean_std: mean + k*std
+  method: "percentile"
+  percentile: 99.0
+  k_std: 3.0
+
+paths:
+  artifacts_dir: "artifacts"

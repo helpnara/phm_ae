@@ -1,0 +1,40 @@
+"""평가지표 산출 (라벨이 있을 때). 불균형 데이터이므로 정확도는 참고용."""
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
+import numpy as np
+
+
+def compute_metrics(
+    y_true: np.ndarray, errors: np.ndarray, predictions: np.ndarray
+) -> Dict[str, Any]:
+    """혼동행렬, precision/recall/F1, ROC-AUC, PR-AUC를 계산한다.
+
+    y_true: 0=정상, 1=이상
+    errors: 재구성 오차(연속 점수, AUC용)
+    predictions: 0/1 (임계값 적용 결과)
+    """
+    from sklearn.metrics import (
+        confusion_matrix, precision_score, recall_score, f1_score,
+        roc_auc_score, average_precision_score, accuracy_score,
+    )
+
+    y_true = np.asarray(y_true).astype(int)
+    metrics: Dict[str, Any] = {}
+    metrics["accuracy"] = float(accuracy_score(y_true, predictions))
+    metrics["precision"] = float(precision_score(y_true, predictions, zero_division=0))
+    metrics["recall"] = float(recall_score(y_true, predictions, zero_division=0))
+    metrics["f1"] = float(f1_score(y_true, predictions, zero_division=0))
+
+    # AUC는 양/음 클래스가 모두 있어야 계산 가능
+    if len(np.unique(y_true)) == 2:
+        metrics["roc_auc"] = float(roc_auc_score(y_true, errors))
+        metrics["pr_auc"] = float(average_precision_score(y_true, errors))
+    else:
+        metrics["roc_auc"] = None
+        metrics["pr_auc"] = None
+
+    cm = confusion_matrix(y_true, predictions, labels=[0, 1])
+    metrics["confusion_matrix"] = cm.tolist()  # [[TN, FP], [FN, TP]]
+    return metrics
