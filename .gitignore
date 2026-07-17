@@ -1,6 +1,7 @@
-# 데이터 / 아티팩트 (대용량, 재현 가능)
+# 데이터 / 아티팩트 / 모델 레지스트리 (대용량, 재현 가능)
 data/
 artifacts/
+models/
 
 # Python
 __pycache__/

@@ -19,7 +19,6 @@ import io
 import json
 import os
 import sys
-import tempfile
 import zipfile
 
 import numpy as np
@@ -36,11 +35,18 @@ from src.config import load_config
 from src.detector import AnomalyDetector
 from src.data import infer_feature_columns, load_meta
 from src import eda as EDA
+from src import registry as REG
 
 st.set_page_config(page_title="PHM 이상탐지", page_icon="🔧", layout="wide")
 
 NORMAL_C = "#2c7fb8"
 ANOM_C = "#d7301f"
+
+
+@st.cache_resource(show_spinner="모델 로딩 중...")
+def get_detector(path: str) -> AnomalyDetector:
+    """레지스트리 경로의 모델을 로드(캐시). 경로가 키이므로 모델별로 캐시된다."""
+    return AnomalyDetector(path)
 
 
 def _note(text: str) -> None:
@@ -51,10 +57,11 @@ def _note(text: str) -> None:
 
 
 def _reset_if_new_upload(uploaded) -> None:
+    """새 업로드 시 EDA/학습 진행 상태만 초기화한다(선택된 모델은 유지)."""
     sig = None if uploaded is None else (uploaded.name, uploaded.size)
     if st.session_state.get("upload_sig") != sig:
         st.session_state["upload_sig"] = sig
-        for k in ("detector", "train_note", "show_eda", "pending_train", "thr_slider"):
+        for k in ("show_eda", "pending_train", "thr_slider"):
             st.session_state.pop(k, None)
 
 
@@ -69,10 +76,12 @@ def _zip_dir(path: str) -> bytes:
     return buf.getvalue()
 
 
-def train_and_store(df, cfg, artifacts_dir, label_col, settings,
-                    model_type="dense", window=None) -> bool:
+def train_and_store(df, cfg, models_dir, label_col, settings, model_type, window,
+                    model_name) -> str | None:
+    """학습 후 레지스트리에 새 모델을 저장하고 그 경로를 반환한다."""
     from tensorflow import keras
     from src.train import train_from_dataframe
+    from src.evaluate import compute_metrics
 
     cfg = copy.deepcopy(cfg)
     cfg["train"]["epochs"] = int(settings["epochs"])
@@ -89,11 +98,12 @@ def train_and_store(df, cfg, artifacts_dir, label_col, settings,
     else:
         note = f"{kind} · 업로드 {len(df):,}건을 정상으로 간주해 학습 후 판정"
 
-    min_rows = int(window or 20) + 20 if model_type == "lstm" else 20
+    min_rows = (int(window or 20) + 20) if model_type == "lstm" else 20
     if len(train_df) < min_rows:
         st.error(f"학습 데이터가 부족합니다(현재 {len(train_df)}건, 최소 {min_rows}건).")
-        return False
+        return None
 
+    entry_dir = REG.new_entry_dir(models_dir, model_type, model_name)
     st.caption(note + f" · epoch {cfg['train']['epochs']} · 임계 {cfg['threshold']['percentile']}%")
     epochs = max(int(cfg["train"]["epochs"]), 1)
     bar = st.progress(0.0, text="학습 준비 중...")
@@ -107,21 +117,30 @@ def train_and_store(df, cfg, artifacts_dir, label_col, settings,
                                f"val_loss={logs.get('val_loss', 0.0):.5f}"))
 
     try:
-        train_from_dataframe(train_df, cfg, artifacts_dir=artifacts_dir,
+        train_from_dataframe(train_df, cfg, artifacts_dir=entry_dir,
                              extra_callbacks=[_P()], verbose=0,
                              data_source="streamlit upload",
                              model_type=model_type, window=window)
     except Exception as e:  # noqa: BLE001
         bar.empty()
+        REG.delete_model(entry_dir)
         st.error(f"학습 실패: {e}")
-        return False
+        return None
 
     bar.progress(1.0, text="학습 완료 ✓")
-    det = AnomalyDetector(artifacts_dir)
-    st.session_state["detector"] = det
+
+    # 레지스트리 항목 정보(이름 + 평가지표) 저장
+    metrics = None
+    if has_label:
+        det = AnomalyDetector(entry_dir)
+        res = det.predict(df)
+        mm = compute_metrics(df[label_col].values, res.errors, res.predictions)
+        metrics = {k: mm[k] for k in ("f1", "pr_auc", "precision", "recall")}
+    default_name = os.path.basename(entry_dir)
+    REG.write_entry_info(entry_dir, {"name": (model_name or default_name), "metrics": metrics})
+
     st.session_state["train_note"] = note
-    st.session_state["thr_slider"] = float(det.threshold)
-    return True
+    return entry_dir
 
 
 @st.dialog("⏱️ 시계열 윈도우 모델 선택")
@@ -460,6 +479,14 @@ def render_results(detector, df, label_col):
 
 # ----------------------------- 메인 -----------------------------
 
+def _model_label(m: dict) -> str:
+    t = "LSTM" if m["model_type"] == "lstm" else "Dense"
+    s = f"{m['name']} · {t}"
+    if m.get("metrics") and m["metrics"].get("f1") is not None:
+        s += f" · F1 {m['metrics']['f1']:.2f}"
+    return s
+
+
 def main():
     st.title("🔧 PHM 오토인코더 기반 이상탐지")
 
@@ -467,56 +494,87 @@ def main():
     label_col = cfg["data"].get("label_column")
     ts_col = cfg["data"].get("timestamp_column")
     exclude = list(cfg["data"].get("exclude_columns", []))
-    if "artifacts_dir" not in st.session_state:
-        st.session_state["artifacts_dir"] = tempfile.mkdtemp(prefix="phm_art_")
-    artifacts_dir = st.session_state["artifacts_dir"]
+    models_dir = os.path.join(ROOT, cfg["paths"].get("models_dir", "models"))
+    os.makedirs(models_dir, exist_ok=True)
+    REG.prune_incomplete(models_dir)  # 중단된 학습의 빈 항목 정리
 
+    # ---- 업로드(메인 상단) ----
+    uploaded = st.file_uploader("CSV 업로드 (학습·판정용)", type=["csv"])
+    _reset_if_new_upload(uploaded)
+    df, feature_cols, td, recommend_ts = None, [], None, False
+    if uploaded is not None:
+        try:
+            df = pd.read_csv(uploaded)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"CSV 읽기 실패: {e}")
+            df = None
+    if df is not None:
+        feature_cols = infer_feature_columns(df, exclude)
+        td = EDA.time_dependency(df, feature_cols, ts_col) if (ts_col in df.columns) else None
+        recommend_ts = bool(td and td["recommend"])
+
+    # ---- 사이드바: 실행 버튼(항상 상단·좌측) + 모델 레지스트리 + 샘플 ----
     with st.sidebar:
-        st.header("샘플 데이터")
-        for fname, cap in [("sample_sensor.csv", "행 단위(정상+이상+label)"),
-                           ("sample_timeseries.csv", "시계열(자기상관 강함) → LSTM 데모")]:
+        st.header("▶ 실행")
+        disabled = df is None
+        eda_clicked = st.button("🔍 EDA", use_container_width=True, disabled=disabled)
+        train_clicked = st.button("🚀 학습", type="primary", use_container_width=True, disabled=disabled)
+        if disabled:
+            st.caption("먼저 CSV를 업로드하세요.")
+        elif td is not None:
+            (st.warning if recommend_ts else st.success)(
+                f"⏱️ 시간 의존성 {'높음' if recommend_ts else '낮음'} (|acf1|={td['mean_abs_acf1']:.2f})")
+        st.text_input("새 모델 이름(선택)", key="model_name_input", placeholder="예: 2월_정상라인A")
+        st.divider()
+
+        st.header("📁 저장된 모델")
+        models = REG.list_models(models_dir)
+        if not models:
+            st.caption("아직 없음 — 학습하면 여기에 저장됩니다.")
+        else:
+            paths = [m["path"] for m in models]
+            labels = {m["path"]: _model_label(m) for m in models}
+            if st.session_state.get("model_select") not in paths:
+                act = st.session_state.get("active_model_dir")
+                st.session_state["model_select"] = act if act in paths else paths[0]
+            chosen = st.selectbox("사용할 모델", paths, key="model_select",
+                                  format_func=lambda p: labels[p])
+            st.session_state["active_model_dir"] = chosen
+            msel = next(m for m in models if m["path"] == chosen)
+            cap = (f"학습 {msel['created_at'][:19]} · 피처 {msel['n_features']} · "
+                   f"샘플 {(msel['n_samples'] or 0):,}")
+            if msel["model_type"] == "lstm" and msel.get("window"):
+                cap += f" · 윈도우 {msel['window']}"
+            st.caption(cap)
+            if st.button("🗑 선택 모델 삭제", use_container_width=True):
+                REG.delete_model(chosen)
+                for k in ("model_select", "active_model_dir", "_last_active"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+        st.divider()
+
+        st.header("📄 샘플 데이터")
+        for fname, capd in [("sample_sensor.csv", "행 단위(정상+이상+label)"),
+                            ("sample_timeseries.csv", "시계열(자기상관 강함) → LSTM 데모")]:
             p = os.path.join(ROOT, "samples", fname)
             if os.path.exists(p):
                 with open(p, "rb") as fp:
                     st.download_button(f"⬇ {fname}", fp.read(), file_name=fname,
                                        mime="text/csv", use_container_width=True)
-                st.caption(cap)
-        st.divider()
-        st.caption("업로드 → (EDA 검토) → 학습 → 결과 확인 순으로 진행하세요.")
+                st.caption(capd)
 
-    # ===== 상단 컨트롤 프레임 =====
+    if df is None:
+        st.info("샘플을 내려받아 업로드하거나 보유 CSV를 올리세요. "
+                "업로드 후 **좌측 상단 'EDA'·'학습'** 버튼으로 실행합니다. "
+                "좌측 **'저장된 모델'** 에서 과거 학습 모델을 선택할 수도 있습니다.")
+        st.stop()
+
+    # ---- 메인 컨트롤 프레임: 미리보기 + 학습 설정 ----
     with st.container(border=True):
-        st.markdown("#### 1️⃣ 데이터 업로드 & 실행")
-        uploaded = st.file_uploader("CSV 업로드 (학습·판정용)", type=["csv"])
-        _reset_if_new_upload(uploaded)
-        if uploaded is None:
-            st.info("샘플을 내려받아 업로드하거나, 보유 CSV를 올리세요. "
-                    "업로드하면 미리보기와 'EDA'·'학습' 버튼이 나타납니다.")
-            st.stop()
-        try:
-            df = pd.read_csv(uploaded)
-        except Exception as e:  # noqa: BLE001
-            st.error(f"CSV 읽기 실패: {e}")
-            st.stop()
-
-        feature_cols = infer_feature_columns(df, exclude)
-        td = EDA.time_dependency(df, feature_cols, ts_col) if (ts_col in df.columns) else None
-        recommend_ts = bool(td and td["recommend"])
-
-        pv, ctrl = st.columns([3, 1.5])
-        with pv:
-            st.dataframe(df.head(), use_container_width=True, height=180)
-        with ctrl:
-            b1, b2 = st.columns(2)
-            eda_clicked = b1.button("🔍 EDA", use_container_width=True)
-            train_clicked = b2.button("🚀 학습", type="primary", use_container_width=True)
-            if td is not None:
-                if recommend_ts:
-                    st.warning(f"⏱️ 시간 의존성 높음(|acf1|={td['mean_abs_acf1']:.2f}) → 학습 시 모델 선택")
-                else:
-                    st.success(f"⏱️ 시간 의존성 낮음(|acf1|={td['mean_abs_acf1']:.2f}) → Dense 적합")
-            st.caption(f"행 {len(df):,} · 열 {df.shape[1]}")
-
+        pv, meta_col = st.columns([3, 1])
+        pv.dataframe(df.head(), use_container_width=True, height=180)
+        meta_col.metric("행", f"{len(df):,}")
+        meta_col.metric("열", f"{df.shape[1]:,}")
         tcfg = cfg["train"]
         with st.expander("⚙️ 학습 설정 (선택)"):
             s = st.columns(4)
@@ -530,39 +588,56 @@ def main():
         settings = {"epochs": set_epochs, "bottleneck": set_bottleneck,
                     "percentile": set_pct, "lr": set_lr}
 
-    # 버튼 처리 / 팝업 / 학습 예약
+    # 클릭 처리 / 팝업 / 학습 예약
     if eda_clicked:
         st.session_state["show_eda"] = True
     if train_clicked:
         if recommend_ts:
-            ts_dialog(default_window=20)          # 팝업 → pending_train 설정 후 rerun
+            ts_dialog(default_window=20)
         else:
             st.session_state["pending_train"] = {"model_type": "dense", "window": None}
 
     # ===== EDA 결과 프레임 =====
-    st.markdown("#### 2️⃣ EDA 결과")
+    st.markdown("#### 🔍 EDA 결과")
     with st.container(border=True, height=560):
         if st.session_state.get("show_eda"):
             render_eda(df, cfg, td)
         else:
-            st.info("상단 **'EDA'** 버튼을 누르면 이 영역에 데이터 분석 결과가 표시됩니다.")
+            st.info("좌측 상단 **'EDA'** 버튼을 누르면 이 영역에 데이터 분석 결과가 표시됩니다.")
 
     # ===== 학습 결과 프레임 =====
-    st.markdown("#### 3️⃣ 학습 결과 및 분석")
+    st.markdown("#### 🚀 학습 결과 및 분석")
     with st.container(border=True, height=720):
         pend = st.session_state.pop("pending_train", None)
         if pend:
-            train_and_store(df, cfg, artifacts_dir, label_col, settings,
-                            model_type=pend["model_type"], window=pend["window"])
-        detector = st.session_state.get("detector")
+            entry = train_and_store(df, cfg, models_dir, label_col, settings,
+                                    pend["model_type"], pend["window"],
+                                    st.session_state.get("model_name_input", ""))
+            if entry:
+                st.session_state["active_model_dir"] = entry
+                st.session_state["model_select"] = entry
+                st.rerun()
+
+        active = st.session_state.get("active_model_dir")
+        if st.session_state.get("_last_active") != active:
+            st.session_state.pop("thr_slider", None)
+            st.session_state["_last_active"] = active
+        detector = get_detector(active) if (active and os.path.isdir(active)) else None
+
         if detector is None:
-            st.info("상단 **'학습'** 버튼을 누르면 이 영역에 학습 품질·판정 결과가 표시됩니다.")
+            st.info("좌측 상단 **'학습'** 으로 새 모델을 만들거나, **'저장된 모델'** 에서 선택하세요.")
         else:
-            if st.session_state.get("train_note"):
-                st.success("학습 완료 · " + st.session_state["train_note"])
-            render_training_quality(detector, df, label_col)
-            st.divider()
-            render_results(detector, df, label_col)
+            meta = load_meta(active)
+            name = REG.read_entry_info(active).get("name", os.path.basename(active))
+            kind = "LSTM-AE(시계열)" if detector.model_type == "lstm" else "Dense AE(행 단위)"
+            st.success(f"현재 모델: **{name}** · {kind} · 학습시각 {meta.get('created_at', '')[:19]}")
+            try:
+                render_training_quality(detector, df, label_col)
+                st.divider()
+                render_results(detector, df, label_col)
+            except ValueError as e:
+                st.error(f"선택한 모델과 업로드 데이터의 스키마가 맞지 않습니다.\n\n{e}\n\n"
+                         f"같은 컬럼 구성의 CSV를 올리거나 새로 학습하세요.")
 
 
 if __name__ == "__main__":
