@@ -37,7 +37,7 @@ CSV를 업로드하면 **웹(Streamlit)** 에서 이상 여부를 테스트할 �
 - 혹시 배포 환경 Python이 특정 패키지와 안 맞으면, Streamlit Cloud **Advanced settings에서
   Python 3.12**를 선택하면 가장 호환성이 넓다.
 
-- 변경 이력: [`CHANGELOG.md`](CHANGELOG.md)
+- 변경 이력: [`CHANGELOG.md`](CHANGELOG.md) · 향후 계획: [`ROADMAP.md`](ROADMAP.md)
 - 요구사항 정의서: [`docs/requirements.md`](docs/requirements.md)
 - 사내 서버·DB 이식 노트: [`docs/migration_notes.md`](docs/migration_notes.md)
 - 개발 가이드: [`CLAUDE.md`](CLAUDE.md)
