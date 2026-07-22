@@ -669,6 +669,8 @@ def _model_label(m: dict) -> str:
     s = f"{m['name']} · {t}"
     if m.get("metrics") and m["metrics"].get("f1") is not None:
         s += f" · F1 {m['metrics']['f1']:.2f}"
+    if m.get("tags"):
+        s += " · 🏷 " + ",".join(m["tags"])
     return s
 
 
@@ -731,6 +733,10 @@ def main():
             if msel["model_type"] == "lstm" and msel.get("window"):
                 cap += f" · 윈도우 {msel['window']}"
             st.caption(cap)
+            if msel.get("tags"):
+                st.caption("🏷 " + ", ".join(msel["tags"]))
+            if msel.get("memo"):
+                st.caption("📝 " + msel["memo"])
             if df is not None:
                 ok, missing = _compat(chosen, df.columns)
                 if ok:
@@ -738,6 +744,21 @@ def main():
                 else:
                     more = "…" if len(missing) > 3 else ""
                     st.caption(f"⚠️ 데이터 **불일치** (누락: {', '.join(missing[:3])}{more})")
+
+            mid = os.path.basename(chosen)
+            with st.expander("✏️ 이름·메모·태그 편집"):
+                en = st.text_input("이름", value=msel["name"], key=f"edit_name_{mid}")
+                em = st.text_area("메모", value=msel.get("memo", ""),
+                                  key=f"edit_memo_{mid}", height=68)
+                et = st.text_input("태그(쉼표로 구분)", value=", ".join(msel.get("tags", [])),
+                                   key=f"edit_tags_{mid}")
+                if st.button("💾 저장", use_container_width=True, key=f"edit_save_{mid}"):
+                    tags = [t.strip() for t in et.split(",") if t.strip()]
+                    REG.update_entry(chosen, name=(en.strip() or msel["name"]),
+                                     memo=em.strip(), tags=tags)
+                    st.success("저장되었습니다.")
+                    st.rerun()
+
             if st.button("🗑 선택 모델 삭제", use_container_width=True):
                 REG.delete_model(chosen)
                 for k in ("model_select", "active_model_dir", "_last_active"):

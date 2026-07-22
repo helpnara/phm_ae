@@ -48,6 +48,15 @@ def read_entry_info(entry_dir: str) -> Dict[str, Any]:
     return {}
 
 
+def update_entry(entry_dir: str, **fields: Any) -> None:
+    """entry.json의 일부 필드(name/memo/tags 등)만 갱신한다(metrics 등은 보존)."""
+    info = read_entry_info(entry_dir)
+    for k, v in fields.items():
+        if v is not None:
+            info[k] = v
+    write_entry_info(entry_dir, info)
+
+
 def list_models(models_dir: str) -> List[Dict[str, Any]]:
     """저장된 모델 목록을 최신순으로 반환한다."""
     if not os.path.isdir(models_dir):
@@ -72,6 +81,8 @@ def list_models(models_dir: str) -> List[Dict[str, Any]]:
             "n_features": meta.get("n_features"),
             "n_samples": meta.get("n_samples"),
             "metrics": info.get("metrics"),
+            "memo": info.get("memo", ""),
+            "tags": info.get("tags", []),
         })
     out.sort(key=lambda x: x["created_at"], reverse=True)
     return out
