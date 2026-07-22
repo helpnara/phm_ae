@@ -29,6 +29,62 @@ def _correlated_normal(n: int, rng: np.random.Generator) -> np.ndarray:
     return NORMAL_MEAN + NORMAL_STD * corr
 
 
+def build_tabular_df(n: int, anomaly_ratio: float, seed: int) -> pd.DataFrame:
+    """행 단위(정상+이상+label) 라벨 데이터프레임을 메모리에서 생성한다(웹 샘플용)."""
+    rng = np.random.default_rng(seed)
+    n_anom = int(n * anomaly_ratio)
+    n_norm = n - n_anom
+    normal = _correlated_normal(n_norm, rng)
+    anom = _correlated_normal(n_anom, rng)
+    for i in range(n_anom):
+        if i % 2 == 0:
+            anom[i, 0] += rng.uniform(15, 25)    # temperature
+            anom[i, 1] += rng.uniform(1.5, 3.0)  # vibration
+        else:
+            j = rng.integers(0, len(SENSORS))
+            anom[i, j] += rng.choice([-1, 1]) * NORMAL_STD[j] * rng.uniform(6, 10)
+    X = np.vstack([normal, anom])
+    y = np.concatenate([np.zeros(n_norm, dtype=int), np.ones(n_anom, dtype=int)])
+    perm = rng.permutation(n)
+    X, y = X[perm], y[perm]
+    ts = pd.date_range("2026-02-01", periods=n, freq="min")
+    df = pd.DataFrame(X, columns=SENSORS)
+    df.insert(0, "timestamp", ts)
+    df["label"] = y
+    return df
+
+
+def build_timeseries_df(n: int, anomaly_ratio: float, seed: int) -> pd.DataFrame:
+    """시계열(AR(1) 자기상관 강함) 라벨 데이터프레임을 생성한다(LSTM 데모용)."""
+    rng = np.random.default_rng(seed)
+    phi = np.array([0.92, 0.90, 0.88, 0.90, 0.85])
+
+    def ar1(m: int) -> np.ndarray:
+        x = np.zeros((m, len(SENSORS)))
+        x[0] = NORMAL_MEAN
+        eps = rng.standard_normal((m, len(SENSORS))) * NORMAL_STD * np.sqrt(1 - phi ** 2)
+        for t in range(1, m):
+            x[t] = NORMAL_MEAN + phi * (x[t - 1] - NORMAL_MEAN) + eps[t]
+        return x
+
+    X = ar1(n)
+    y = np.zeros(n, dtype=int)
+    target = int(n * anomaly_ratio)
+    injected = 0
+    while injected < target:
+        L = int(rng.integers(5, 16))
+        start = int(rng.integers(0, max(n - L, 1)))
+        j = int(rng.integers(0, len(SENSORS)))
+        X[start:start + L, j] += rng.choice([-1, 1]) * NORMAL_STD[j] * rng.uniform(4, 7)
+        y[start:start + L] = 1
+        injected = int(y.sum())
+    ts = pd.date_range("2026-03-01", periods=n, freq="min")
+    df = pd.DataFrame(X, columns=SENSORS)
+    df.insert(0, "timestamp", ts)
+    df["label"] = y
+    return df
+
+
 def generate(n_normal: int, n_test: int, anomaly_ratio: float, out_dir: str, seed: int) -> None:
     rng = np.random.default_rng(seed)
     os.makedirs(out_dir, exist_ok=True)

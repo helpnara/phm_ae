@@ -662,7 +662,13 @@ def render_manual(detector):
         _note("오차가 큰 피처가 정상 패턴에서 벗어난 센서입니다. 이상 판정 시 해당 센서를 우선 점검하세요.")
 
 
-# ----------------------------- 메인 -----------------------------
+# ----------------------------- 메뉴/페이지 -----------------------------
+
+MENU_EDA = "🔍 1. EDA"
+MENU_TRAIN = "🛠 2. 모델 생성"
+MENU_EVAL = "📊 3. 모델 평가"
+MENU_MON = "📈 4. 성능 모니터링"
+
 
 def _model_label(m: dict) -> str:
     t = "LSTM" if m["model_type"] == "lstm" else "Dense"
@@ -674,6 +680,261 @@ def _model_label(m: dict) -> str:
     return s
 
 
+def _set_data(df, name):
+    st.session_state["data_df"] = df
+    st.session_state["data_name"] = name
+    st.session_state["eda_ran"] = False
+
+
+def sidebar_registry(models_dir, df_for_compat=None, show_new_name=False):
+    """사이드바 '저장된 모델' 섹션: 선택·편집·삭제(+선택 시 새 모델 이름)."""
+    if show_new_name:
+        st.text_input("새 모델 이름(선택)", key="model_name_input", placeholder="예: 2월_정상라인A")
+        st.divider()
+    st.header("📁 저장된 모델")
+    models = REG.list_models(models_dir)
+    if not models:
+        st.caption("아직 없음 — '모델 생성'에서 학습하면 저장됩니다.")
+        return
+    paths = [m["path"] for m in models]
+    labels = {m["path"]: _model_label(m) for m in models}
+    if st.session_state.get("model_select") not in paths:
+        act = st.session_state.get("active_model_dir")
+        st.session_state["model_select"] = act if act in paths else paths[0]
+    chosen = st.selectbox("사용할 모델", paths, key="model_select", format_func=lambda p: labels[p])
+    st.session_state["active_model_dir"] = chosen
+    msel = next(m for m in models if m["path"] == chosen)
+    cap = (f"학습 {msel['created_at'][:19]} · 피처 {msel['n_features']} · "
+           f"샘플 {(msel['n_samples'] or 0):,}")
+    if msel["model_type"] == "lstm" and msel.get("window"):
+        cap += f" · 윈도우 {msel['window']}"
+    st.caption(cap)
+    if msel.get("tags"):
+        st.caption("🏷 " + ", ".join(msel["tags"]))
+    if msel.get("memo"):
+        st.caption("📝 " + msel["memo"])
+    if df_for_compat is not None:
+        ok, missing = _compat(chosen, df_for_compat.columns)
+        if ok:
+            st.caption("✅ 현재 데이터와 **호환**")
+        else:
+            more = "…" if len(missing) > 3 else ""
+            st.caption(f"⚠️ 데이터 **불일치** (누락: {', '.join(missing[:3])}{more})")
+
+    mid = os.path.basename(chosen)
+    with st.expander("✏️ 이름·메모·태그 편집"):
+        en = st.text_input("이름", value=msel["name"], key=f"edit_name_{mid}")
+        em = st.text_area("메모", value=msel.get("memo", ""), key=f"edit_memo_{mid}", height=68)
+        et = st.text_input("태그(쉼표로 구분)", value=", ".join(msel.get("tags", [])),
+                           key=f"edit_tags_{mid}")
+        if st.button("💾 저장", use_container_width=True, key=f"edit_save_{mid}"):
+            tags = [t.strip() for t in et.split(",") if t.strip()]
+            REG.update_entry(chosen, name=(en.strip() or msel["name"]), memo=em.strip(), tags=tags)
+            st.success("저장되었습니다.")
+            st.rerun()
+    if st.button("🗑 선택 모델 삭제", use_container_width=True):
+        REG.delete_model(chosen)
+        for k in ("model_select", "active_model_dir", "_last_active"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
+
+def page_eda(cfg, ts_col, exclude):
+    from src.generate_synthetic import build_tabular_df, build_timeseries_df
+    st.header("🔍 1. EDA · 데이터 탐색")
+    st.caption("데이터를 업로드하거나 합성 샘플을 생성한 뒤 EDA를 실행합니다. "
+               "여기서 준비한 데이터는 '모델 생성'에서도 그대로 사용됩니다.")
+
+    tab_up, tab_gen = st.tabs(["📤 CSV 업로드", "🧪 샘플 생성"])
+    with tab_up:
+        up = st.file_uploader("CSV 업로드", type=["csv"], key="eda_upload")
+        if up is not None:
+            sig = (up.name, up.size)
+            if st.session_state.get("_eda_up_sig") != sig:
+                st.session_state["_eda_up_sig"] = sig
+                try:
+                    _set_data(pd.read_csv(up), up.name)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"CSV 읽기 실패: {e}")
+    with tab_gen:
+        g = st.columns(4)
+        kind = g[0].selectbox("유형", ["행 단위", "시계열(자기상관)"], key="gen_kind")
+        n = g[1].number_input("행 수", 100, 20000, 600, step=100, key="gen_n")
+        ratio = g[2].number_input("이상 비율", 0.0, 0.5, 0.1, step=0.05, key="gen_ratio")
+        seed = g[3].number_input("seed", 0, 9999, 42, key="gen_seed")
+        if st.button("🧪 샘플 생성", type="primary"):
+            gdf = (build_timeseries_df(int(n), float(ratio), int(seed))
+                   if kind.startswith("시계열") else build_tabular_df(int(n), float(ratio), int(seed)))
+            _set_data(gdf, f"합성-{kind}({int(n)}행)")
+            st.success("샘플이 생성되었습니다.")
+
+    df = st.session_state.get("data_df")
+    if df is None:
+        st.info("데이터를 업로드하거나 합성 샘플을 생성하세요.")
+        return
+    st.divider()
+    t1, t2 = st.columns([3, 1])
+    t1.caption(f"현재 데이터: **{st.session_state.get('data_name', '?')}** · "
+               f"{len(df):,}행 × {df.shape[1]}열")
+    t2.download_button("현재 데이터 CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                       "data.csv", "text/csv", use_container_width=True)
+    st.dataframe(df.head(), use_container_width=True, height=180)
+    if st.button("🔍 EDA 실행", type="primary"):
+        st.session_state["eda_ran"] = True
+    if st.session_state.get("eda_ran"):
+        td = (EDA.time_dependency(df, infer_feature_columns(df, exclude), ts_col)
+              if (ts_col in df.columns) else None)
+        st.divider()
+        render_eda(df, cfg, td)
+    else:
+        st.info("**'EDA 실행'** 을 누르면 통계·분포·상관·시간의존성 분석이 표시됩니다.")
+
+
+def page_train(cfg, models_dir, label_col, ts_col, exclude):
+    st.header("🛠 2. 모델 생성 (학습)")
+    df = st.session_state.get("data_df")
+    if df is None:
+        st.info("먼저 'EDA' 메뉴에서 데이터를 준비하세요. 또는 아래에서 바로 업로드할 수 있습니다.")
+        up = st.file_uploader("학습 데이터 CSV", type=["csv"], key="train_upload")
+        if up is not None:
+            try:
+                _set_data(pd.read_csv(up), up.name)
+                st.rerun()
+            except Exception as e:  # noqa: BLE001
+                st.error(f"CSV 읽기 실패: {e}")
+        return
+
+    st.caption(f"학습 데이터: **{st.session_state.get('data_name', '?')}** · {len(df):,}행 "
+               f"(정상 데이터로 학습 — label=0만 사용)")
+    st.dataframe(df.head(), use_container_width=True, height=150)
+
+    feature_cols = infer_feature_columns(df, exclude)
+    td = EDA.time_dependency(df, feature_cols, ts_col) if (ts_col in df.columns) else None
+    recommend_ts = bool(td and td["recommend"])
+    if td is not None:
+        msg = ("높음 → 학습 시 모델 선택(LSTM/Dense)" if recommend_ts
+               else "낮음 → 행 단위(Dense) 적합")
+        (st.warning if recommend_ts else st.success)(
+            f"⏱️ 시간 의존성 {msg} (|acf1|={td['mean_abs_acf1']:.2f})")
+
+    tcfg = cfg["train"]
+    with st.expander("⚙️ 학습 설정 (선택)"):
+        s = st.columns(4)
+        set_epochs = s[0].number_input("epoch", 10, 500, int(tcfg["epochs"]), step=10)
+        set_bottleneck = s[1].number_input("병목 차원", 2, 64, int(cfg["model"]["bottleneck"]))
+        set_pct = s[2].number_input("임계값 백분위수(%)", 90.0, 99.9,
+                                    float(cfg["threshold"].get("percentile", 99.0)), step=0.5)
+        set_lr = s[3].number_input("learning rate", 0.0001, 0.1,
+                                   float(tcfg["learning_rate"]), step=0.0001, format="%.4f")
+        st.caption("병목이 크면 이상까지 복원해 탐지가 약해집니다. 백분위수↑ = 보수적 판정.")
+    settings = {"epochs": set_epochs, "bottleneck": set_bottleneck,
+                "percentile": set_pct, "lr": set_lr}
+
+    if st.button("🚀 학습 시작", type="primary"):
+        if recommend_ts:
+            ts_dialog(default_window=20)
+        else:
+            st.session_state["pending_train"] = {"model_type": "dense", "window": None}
+
+    pend = st.session_state.pop("pending_train", None)
+    if pend:
+        entry = train_and_store(df, cfg, models_dir, label_col, settings,
+                                pend["model_type"], pend["window"],
+                                st.session_state.get("model_name_input", ""))
+        if entry:
+            st.session_state["active_model_dir"] = entry
+            st.session_state["model_select"] = entry
+            st.rerun()
+
+    active = st.session_state.get("active_model_dir")
+    det = get_detector(active) if (active and os.path.isdir(active)) else None
+    if det is not None:
+        st.divider()
+        name = REG.read_entry_info(active).get("name", os.path.basename(active))
+        kind = "LSTM-AE(시계열)" if det.model_type == "lstm" else "Dense AE(행 단위)"
+        st.success(f"현재 모델: **{name}** · {kind}")
+        try:
+            render_training_quality(det, df, label_col)
+        except ValueError:
+            st.warning("현재 선택된 모델은 이 데이터와 스키마가 달라 학습 품질을 표시할 수 없습니다. "
+                       "이 데이터로 새로 학습하거나 호환 모델을 선택하세요.")
+        st.caption("상세 판정·평가는 **'모델 평가'** 메뉴에서 진행하세요.")
+
+
+def page_eval(cfg, models_dir, label_col):
+    st.header("📊 3. 모델 평가")
+    active = st.session_state.get("active_model_dir")
+    det = get_detector(active) if (active and os.path.isdir(active)) else None
+    if det is None:
+        st.info("좌측 **'저장된 모델'** 에서 평가할 모델을 선택하세요. "
+                "(모델이 없으면 '모델 생성'에서 먼저 학습)")
+        return
+    name = REG.read_entry_info(active).get("name", os.path.basename(active))
+    kind = "LSTM-AE(시계열)" if det.model_type == "lstm" else "Dense AE(행 단위)"
+    st.success(f"평가 대상 모델: **{name}** · {kind} · 피처 {len(det.schema.feature_columns)}개")
+
+    mode = st.radio("평가 방식", ["⌨️ 단일 샘플 판정", "📄 테스트셋 파일 평가", "📊 모델 비교"],
+                    horizontal=True, key="eval_mode")
+    st.divider()
+
+    if mode.startswith("⌨️"):
+        render_manual(det)
+    elif mode.startswith("📄"):
+        up = st.file_uploader("테스트셋 CSV 업로드", type=["csv"], key="eval_upload")
+        if up is None:
+            st.info("새 테스트셋 CSV를 업로드하면 판정 결과·평가지표·개별 진단을 확인합니다.")
+            return
+        try:
+            tdf = pd.read_csv(up)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"CSV 읽기 실패: {e}")
+            return
+        ok, missing = _compat(active, tdf.columns)
+        if not ok:
+            st.error(f"모델과 테스트셋의 스키마가 다릅니다 — 누락 컬럼: {', '.join(missing[:6])}")
+            return
+        st.caption(f"테스트셋: {up.name} · {len(tdf):,}행")
+        try:
+            render_training_quality(det, tdf, label_col)
+            st.divider()
+            render_results(det, tdf, label_col)
+        except ValueError as e:
+            st.error(f"평가 실패: {e}")
+    else:
+        st.caption("호환 모델들을 아래 업로드하는 데이터로 실행해 비교합니다.")
+        up = st.file_uploader("비교용 CSV 업로드", type=["csv"], key="cmp_upload")
+        if up is None:
+            st.info("비교에 사용할 데이터셋을 업로드하세요.")
+            return
+        try:
+            cdf = pd.read_csv(up)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"CSV 읽기 실패: {e}")
+            return
+        render_comparison(models_dir, cdf, label_col)
+
+
+def page_monitor():
+    st.header("📈 4. 모델 성능 모니터링")
+    st.info("🚧 추후 개발 예정 — 운영 단계에서 모델 성능 저하를 조기 감지하기 위한 기능입니다.")
+    st.markdown(
+        "- **드리프트 감지**: 신규 데이터의 재구성 오차 분포가 학습 대비 이동하면 경고\n"
+        "- **시간별 이상률 추이**: 기간별 이상 탐지 비율·평균 오차 트렌드\n"
+        "- **재학습 트리거**: 임계 초과 시 재학습 권고/자동화(사내 스케줄러 연계)\n"
+        "- **알림**: 임계 초과 시 이메일/사내 메신저 통지\n\n"
+        "설계: `docs/migration_notes.md §8`, `ROADMAP.md P3` 참고.")
+    st.divider()
+    st.caption("예시(개발 예정) — 시간에 따른 평균 재구성 오차 추이 & 드리프트 임계")
+    x = list(range(30))
+    base = [0.02 + 0.0004 * i + (0.002 if i > 22 else 0) * (i - 22) for i in x]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=base, name="평균 오차", line=dict(color=NORMAL_C)))
+    fig.add_hline(y=0.035, line_dash="dash", line_color=ANOM_C, annotation_text="드리프트 임계")
+    fig.update_layout(height=300, xaxis_title="일(day)", yaxis_title="평균 재구성 오차",
+                      legend=dict(orientation="h"))
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def main():
     st.title("🔧 PHM 오토인코더 기반 이상탐지")
 
@@ -683,89 +944,20 @@ def main():
     exclude = list(cfg["data"].get("exclude_columns", []))
     models_dir = os.path.join(ROOT, cfg["paths"].get("models_dir", "models"))
     os.makedirs(models_dir, exist_ok=True)
-    REG.prune_incomplete(models_dir)  # 중단된 학습의 빈 항목 정리
+    REG.prune_incomplete(models_dir)
 
-    # ---- 업로드(메인 상단) ----
-    uploaded = st.file_uploader("CSV 업로드 (학습·판정용)", type=["csv"])
-    _reset_if_new_upload(uploaded)
-    df, feature_cols, td, recommend_ts = None, [], None, False
-    if uploaded is not None:
-        try:
-            df = pd.read_csv(uploaded)
-        except Exception as e:  # noqa: BLE001
-            st.error(f"CSV 읽기 실패: {e}")
-            df = None
-    if df is not None:
-        feature_cols = infer_feature_columns(df, exclude)
-        td = EDA.time_dependency(df, feature_cols, ts_col) if (ts_col in df.columns) else None
-        recommend_ts = bool(td and td["recommend"])
-
-    # ---- 사이드바: 실행 버튼(항상 상단·좌측) + 모델 레지스트리 + 샘플 ----
+    # ---- 좌측 메뉴 + 컨텍스트(모델 레지스트리/샘플) ----
     with st.sidebar:
-        st.header("▶ 실행")
-        disabled = df is None
-        eda_clicked = st.button("🔍 EDA", use_container_width=True, disabled=disabled)
-        train_clicked = st.button("🚀 학습", type="primary", use_container_width=True, disabled=disabled)
-        if disabled:
-            st.caption("먼저 CSV를 업로드하세요.")
-        elif td is not None:
-            (st.warning if recommend_ts else st.success)(
-                f"⏱️ 시간 의존성 {'높음' if recommend_ts else '낮음'} (|acf1|={td['mean_abs_acf1']:.2f})")
-        st.text_input("새 모델 이름(선택)", key="model_name_input", placeholder="예: 2월_정상라인A")
+        st.header("메뉴")
+        page = st.radio("메뉴", [MENU_EDA, MENU_TRAIN, MENU_EVAL, MENU_MON],
+                        label_visibility="collapsed", key="menu")
         st.divider()
-
-        st.header("📁 저장된 모델")
-        models = REG.list_models(models_dir)
-        if not models:
-            st.caption("아직 없음 — 학습하면 여기에 저장됩니다.")
-        else:
-            paths = [m["path"] for m in models]
-            labels = {m["path"]: _model_label(m) for m in models}
-            if st.session_state.get("model_select") not in paths:
-                act = st.session_state.get("active_model_dir")
-                st.session_state["model_select"] = act if act in paths else paths[0]
-            chosen = st.selectbox("사용할 모델", paths, key="model_select",
-                                  format_func=lambda p: labels[p])
-            st.session_state["active_model_dir"] = chosen
-            msel = next(m for m in models if m["path"] == chosen)
-            cap = (f"학습 {msel['created_at'][:19]} · 피처 {msel['n_features']} · "
-                   f"샘플 {(msel['n_samples'] or 0):,}")
-            if msel["model_type"] == "lstm" and msel.get("window"):
-                cap += f" · 윈도우 {msel['window']}"
-            st.caption(cap)
-            if msel.get("tags"):
-                st.caption("🏷 " + ", ".join(msel["tags"]))
-            if msel.get("memo"):
-                st.caption("📝 " + msel["memo"])
-            if df is not None:
-                ok, missing = _compat(chosen, df.columns)
-                if ok:
-                    st.caption("✅ 업로드 데이터와 **호환**")
-                else:
-                    more = "…" if len(missing) > 3 else ""
-                    st.caption(f"⚠️ 데이터 **불일치** (누락: {', '.join(missing[:3])}{more})")
-
-            mid = os.path.basename(chosen)
-            with st.expander("✏️ 이름·메모·태그 편집"):
-                en = st.text_input("이름", value=msel["name"], key=f"edit_name_{mid}")
-                em = st.text_area("메모", value=msel.get("memo", ""),
-                                  key=f"edit_memo_{mid}", height=68)
-                et = st.text_input("태그(쉼표로 구분)", value=", ".join(msel.get("tags", [])),
-                                   key=f"edit_tags_{mid}")
-                if st.button("💾 저장", use_container_width=True, key=f"edit_save_{mid}"):
-                    tags = [t.strip() for t in et.split(",") if t.strip()]
-                    REG.update_entry(chosen, name=(en.strip() or msel["name"]),
-                                     memo=em.strip(), tags=tags)
-                    st.success("저장되었습니다.")
-                    st.rerun()
-
-            if st.button("🗑 선택 모델 삭제", use_container_width=True):
-                REG.delete_model(chosen)
-                for k in ("model_select", "active_model_dir", "_last_active"):
-                    st.session_state.pop(k, None)
-                st.rerun()
-        st.divider()
-
+        if page in (MENU_TRAIN, MENU_EVAL):
+            data_df = st.session_state.get("data_df")
+            sidebar_registry(models_dir,
+                             df_for_compat=(data_df if page == MENU_TRAIN else None),
+                             show_new_name=(page == MENU_TRAIN))
+            st.divider()
         st.header("📄 샘플 데이터")
         for fname, capd in [("sample_sensor.csv", "행 단위(정상+이상+label)"),
                             ("sample_timeseries.csv", "시계열(자기상관 강함) → LSTM 데모")]:
@@ -774,98 +966,22 @@ def main():
                 with open(p, "rb") as fp:
                     st.download_button(f"⬇ {fname}", fp.read(), file_name=fname,
                                        mime="text/csv", use_container_width=True)
-                st.caption(capd)
 
-    if df is None:
-        st.info("샘플을 내려받아 업로드하거나 보유 CSV를 올리세요. "
-                "업로드 후 **좌측 상단 'EDA'·'학습'** 버튼으로 실행합니다. "
-                "좌측 **'저장된 모델'** 에서 과거 학습 모델을 선택할 수도 있습니다.")
-        st.stop()
+    # 활성 모델 변경 시 임계값 슬라이더 초기화
+    active = st.session_state.get("active_model_dir")
+    if st.session_state.get("_last_active") != active:
+        st.session_state.pop("thr_slider", None)
+        st.session_state["_last_active"] = active
 
-    # ---- 메인 컨트롤 프레임: 미리보기 + 학습 설정 ----
-    with st.container(border=True):
-        pv, meta_col = st.columns([3, 1])
-        pv.dataframe(df.head(), use_container_width=True, height=180)
-        meta_col.metric("행", f"{len(df):,}")
-        meta_col.metric("열", f"{df.shape[1]:,}")
-        tcfg = cfg["train"]
-        with st.expander("⚙️ 학습 설정 (선택)"):
-            s = st.columns(4)
-            set_epochs = s[0].number_input("epoch", 10, 500, int(tcfg["epochs"]), step=10)
-            set_bottleneck = s[1].number_input("병목 차원", 2, 64, int(cfg["model"]["bottleneck"]))
-            set_pct = s[2].number_input("임계값 백분위수(%)", 90.0, 99.9,
-                                        float(cfg["threshold"].get("percentile", 99.0)), step=0.5)
-            set_lr = s[3].number_input("learning rate", 0.0001, 0.1,
-                                       float(tcfg["learning_rate"]), step=0.0001, format="%.4f")
-            st.caption("병목이 크면 이상까지 복원해 탐지가 약해집니다. 백분위수↑ = 보수적 판정.")
-        settings = {"epochs": set_epochs, "bottleneck": set_bottleneck,
-                    "percentile": set_pct, "lr": set_lr}
-
-    # 클릭 처리 / 팝업 / 학습 예약
-    if eda_clicked:
-        st.session_state["show_eda"] = True
-    if train_clicked:
-        if recommend_ts:
-            ts_dialog(default_window=20)
-        else:
-            st.session_state["pending_train"] = {"model_type": "dense", "window": None}
-
-    # ===== EDA 결과 프레임 =====
-    st.markdown("#### 🔍 EDA 결과")
-    with st.container(border=True, height=560):
-        if st.session_state.get("show_eda"):
-            render_eda(df, cfg, td)
-        else:
-            st.info("좌측 상단 **'EDA'** 버튼을 누르면 이 영역에 데이터 분석 결과가 표시됩니다.")
-
-    # ===== 학습 결과 프레임 =====
-    st.markdown("#### 🚀 학습 결과 및 분석")
-    with st.container(border=True, height=720):
-        pend = st.session_state.pop("pending_train", None)
-        if pend:
-            entry = train_and_store(df, cfg, models_dir, label_col, settings,
-                                    pend["model_type"], pend["window"],
-                                    st.session_state.get("model_name_input", ""))
-            if entry:
-                st.session_state["active_model_dir"] = entry
-                st.session_state["model_select"] = entry
-                st.rerun()
-
-        active = st.session_state.get("active_model_dir")
-        if st.session_state.get("_last_active") != active:
-            st.session_state.pop("thr_slider", None)
-            st.session_state["_last_active"] = active
-        detector = get_detector(active) if (active and os.path.isdir(active)) else None
-
-        if detector is None:
-            st.info("좌측 상단 **'학습'** 으로 새 모델을 만들거나, **'저장된 모델'** 에서 선택하세요.")
-        else:
-            meta = load_meta(active)
-            name = REG.read_entry_info(active).get("name", os.path.basename(active))
-            kind = "LSTM-AE(시계열)" if detector.model_type == "lstm" else "Dense AE(행 단위)"
-            st.success(f"현재 모델: **{name}** · {kind} · 학습시각 {meta.get('created_at', '')[:19]}")
-            try:
-                render_training_quality(detector, df, label_col)
-                st.divider()
-                render_results(detector, df, label_col)
-            except ValueError as e:
-                st.error(f"선택한 모델과 업로드 데이터의 스키마가 맞지 않습니다.\n\n{e}\n\n"
-                         f"같은 컬럼 구성의 CSV를 올리거나 새로 학습하세요.")
-
-    # ===== 단건 수동 판정 프레임 =====
-    st.markdown("#### ⌨️ 단건 수동 판정")
-    with st.container(border=True):
-        _active = st.session_state.get("active_model_dir")
-        _det = get_detector(_active) if (_active and os.path.isdir(_active)) else None
-        if _det is None:
-            st.info("먼저 학습하거나 좌측 **'저장된 모델'** 에서 선택하면 단건 판정이 가능합니다.")
-        else:
-            render_manual(_det)
-
-    # ===== 모델 비교 프레임 =====
-    st.markdown("#### 📊 모델 비교")
-    with st.container(border=True, height=620):
-        render_comparison(models_dir, df, label_col)
+    # ---- 라우팅 ----
+    if page == MENU_EDA:
+        page_eda(cfg, ts_col, exclude)
+    elif page == MENU_TRAIN:
+        page_train(cfg, models_dir, label_col, ts_col, exclude)
+    elif page == MENU_EVAL:
+        page_eval(cfg, models_dir, label_col)
+    else:
+        page_monitor()
 
 
 if __name__ == "__main__":
