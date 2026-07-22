@@ -33,7 +33,7 @@ if ROOT not in sys.path:
 
 from src.config import load_config
 from src.detector import AnomalyDetector
-from src.data import infer_feature_columns, load_meta
+from src.data import infer_feature_columns, load_meta, load_schema
 from src import eda as EDA
 from src import registry as REG
 
@@ -61,8 +61,28 @@ def _reset_if_new_upload(uploaded) -> None:
     sig = None if uploaded is None else (uploaded.name, uploaded.size)
     if st.session_state.get("upload_sig") != sig:
         st.session_state["upload_sig"] = sig
-        for k in ("show_eda", "pending_train", "thr_slider"):
+        for k in ("show_eda", "pending_train", "thr_slider", "cmp_result", "cmp_select"):
             st.session_state.pop(k, None)
+
+
+@st.cache_data(show_spinner=False)
+def _model_features(path: str, _mtime: float):
+    """모델 스키마의 피처 컬럼(TF 로드 없이 schema.json만 읽어 캐시)."""
+    try:
+        return load_schema(path).feature_columns
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _compat(path: str, df_columns) -> tuple[bool, list]:
+    """모델과 업로드 데이터의 스키마 호환성. (호환여부, 누락 피처)."""
+    schema_path = os.path.join(path, "schema.json")
+    mtime = os.path.getmtime(schema_path) if os.path.exists(schema_path) else 0.0
+    fc = _model_features(path, mtime)
+    if fc is None:
+        return False, ["스키마 없음"]
+    missing = [c for c in fc if c not in df_columns]
+    return (len(missing) == 0), missing
 
 
 def _zip_dir(path: str) -> bytes:
@@ -477,6 +497,105 @@ def render_results(detector, df, label_col):
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+# ----------------------------- 모델 비교 -----------------------------
+
+def _run_comparison(paths, df, label_col):
+    """선택 모델들을 현재 업로드 데이터로 실행해 비교 결과를 세션에 저장한다."""
+    from src.evaluate import compute_metrics, roc_curve_points, pr_curve_points
+    has_label = bool(label_col) and label_col in df.columns
+    rows, curves = [], []
+    for path in paths:
+        det = get_detector(path)
+        res = det.predict(df)
+        name = REG.read_entry_info(path).get("name", os.path.basename(path))
+        na = int(res.predictions.sum())
+        row = {"모델": name, "종류": det.model_type,
+               "이상건수": na, "이상%": round(na / max(len(df), 1) * 100, 1)}
+        entry = {"name": name}
+        if has_label:
+            m = compute_metrics(df[label_col].values, res.errors, res.predictions)
+            row.update({"Precision": round(m["precision"], 3), "Recall": round(m["recall"], 3),
+                        "F1": round(m["f1"], 3),
+                        "PR-AUC": round(m["pr_auc"], 3) if m["pr_auc"] is not None else None,
+                        "ROC-AUC": round(m["roc_auc"], 3) if m["roc_auc"] is not None else None})
+            entry["roc"] = roc_curve_points(df[label_col].values, res.errors)
+            entry["pr"] = pr_curve_points(df[label_col].values, res.errors)
+        rows.append(row)
+        curves.append(entry)
+    st.session_state["cmp_result"] = {"rows": rows, "curves": curves, "has_label": has_label}
+
+
+def _render_comparison_result():
+    r = st.session_state.get("cmp_result")
+    if not r:
+        return
+    st.markdown("**비교 결과** (현재 업로드 데이터 기준)")
+    tbl = pd.DataFrame(r["rows"]).set_index("모델")
+    # 최고 성능 강조(F1 있으면 F1, 없으면 이상% 최소)
+    if r["has_label"] and "F1" in tbl.columns:
+        st.dataframe(tbl.style.highlight_max(subset=["F1"], color="#c7e9c0")
+                     .format(precision=3), use_container_width=True)
+    else:
+        st.dataframe(tbl, use_container_width=True)
+
+    palette = ["#2c7fb8", "#d7301f", "#238b45", "#e6550d", "#6a51a3", "#08519c"]
+    if r["has_label"]:
+        cc = st.columns(2)
+        roc = go.Figure()
+        pr = go.Figure()
+        for i, e in enumerate(r["curves"]):
+            col = palette[i % len(palette)]
+            if e.get("roc"):
+                roc.add_trace(go.Scatter(x=e["roc"]["fpr"], y=e["roc"]["tpr"], name=e["name"],
+                                         line=dict(color=col)))
+            if e.get("pr"):
+                pr.add_trace(go.Scatter(x=e["pr"]["recall"], y=e["pr"]["precision"], name=e["name"],
+                                        line=dict(color=col)))
+        roc.add_trace(go.Scatter(x=[0, 1], y=[0, 1], line=dict(dash="dash", color="gray"),
+                                 showlegend=False))
+        roc.update_layout(height=340, title="ROC 비교", xaxis_title="FPR", yaxis_title="TPR",
+                          legend=dict(orientation="h"))
+        pr.update_layout(height=340, title="PR 비교", xaxis_title="Recall", yaxis_title="Precision",
+                         legend=dict(orientation="h"))
+        cc[0].plotly_chart(roc, use_container_width=True)
+        cc[1].plotly_chart(pr, use_container_width=True)
+        _note("동일 데이터로 각 모델을 실행한 결과입니다. F1·PR-AUC가 높고 ROC/PR 곡선이 "
+              "좌상단(ROC)·우상단(PR)에 가까운 모델이 우수합니다.")
+    else:
+        bar = px.bar(pd.DataFrame(r["rows"]), x="모델", y="이상%", color="모델",
+                     color_discrete_sequence=palette)
+        bar.update_layout(height=340, showlegend=False, yaxis_title="이상 탐지 비율(%)")
+        st.plotly_chart(bar, use_container_width=True)
+        _note("라벨이 없어 지표 비교는 생략됩니다. 모델별 이상 탐지 비율을 비교합니다. "
+              "라벨 컬럼이 있으면 F1·ROC/PR로 정량 비교됩니다.")
+
+
+def render_comparison(models_dir, df, label_col):
+    """저장된 모델들을 현재 데이터로 비교한다(호환 모델만)."""
+    models = REG.list_models(models_dir)
+    if len(models) < 2:
+        st.info("저장된 모델이 2개 이상일 때 비교할 수 있습니다. (좌측에서 학습을 더 진행하세요)")
+        return
+    compat = []
+    for m in models:
+        ok, _ = _compat(m["path"], df.columns)
+        if ok:
+            compat.append(m)
+    st.caption(f"전체 {len(models)}개 중 현재 데이터와 **호환 {len(compat)}개**. 호환 모델만 비교 대상입니다.")
+    if len(compat) < 2:
+        st.warning("현재 업로드 데이터와 호환되는 모델이 2개 미만입니다. "
+                   "같은 컬럼 구성의 데이터를 올리거나 해당 데이터로 학습하세요.")
+        return
+    paths = [m["path"] for m in compat]
+    labels = {m["path"]: _model_label(m) for m in compat}
+    sel = st.multiselect("비교할 모델 선택", paths, default=paths[:min(3, len(paths))],
+                         format_func=lambda p: labels[p], key="cmp_select")
+    if st.button("📊 비교 실행", disabled=len(sel) < 2, type="primary"):
+        with st.spinner("선택 모델을 현재 데이터로 실행 중..."):
+            _run_comparison(sel, df, label_col)
+    _render_comparison_result()
+
+
 # ----------------------------- 메인 -----------------------------
 
 def _model_label(m: dict) -> str:
@@ -546,6 +665,13 @@ def main():
             if msel["model_type"] == "lstm" and msel.get("window"):
                 cap += f" · 윈도우 {msel['window']}"
             st.caption(cap)
+            if df is not None:
+                ok, missing = _compat(chosen, df.columns)
+                if ok:
+                    st.caption("✅ 업로드 데이터와 **호환**")
+                else:
+                    more = "…" if len(missing) > 3 else ""
+                    st.caption(f"⚠️ 데이터 **불일치** (누락: {', '.join(missing[:3])}{more})")
             if st.button("🗑 선택 모델 삭제", use_container_width=True):
                 REG.delete_model(chosen)
                 for k in ("model_select", "active_model_dir", "_last_active"):
@@ -638,6 +764,11 @@ def main():
             except ValueError as e:
                 st.error(f"선택한 모델과 업로드 데이터의 스키마가 맞지 않습니다.\n\n{e}\n\n"
                          f"같은 컬럼 구성의 CSV를 올리거나 새로 학습하세요.")
+
+    # ===== 모델 비교 프레임 =====
+    st.markdown("#### 📊 모델 비교")
+    with st.container(border=True, height=620):
+        render_comparison(models_dir, df, label_col)
 
 
 if __name__ == "__main__":
