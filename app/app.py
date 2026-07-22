@@ -392,7 +392,10 @@ def render_results(detector, df, label_col):
     smin, smax = default_thr * 0.1, default_thr * 3
     if rec:
         smax = max(smax, rec["threshold"] * 1.2)
-    st.session_state.setdefault("thr_slider", default_thr)
+    # 활성 모델이 바뀌어 저장된 슬라이더 값이 범위를 벗어나면 기본값으로 보정
+    cur = st.session_state.get("thr_slider")
+    if cur is None or not (smin <= cur <= smax):
+        st.session_state["thr_slider"] = float(default_thr)
 
     sc1, sc2 = st.columns([3, 1.4])
     with sc1:
@@ -686,12 +689,9 @@ def _set_data(df, name):
     st.session_state["eda_ran"] = False
 
 
-def sidebar_registry(models_dir, df_for_compat=None, show_new_name=False):
-    """사이드바 '저장된 모델' 섹션: 선택·편집·삭제(+선택 시 새 모델 이름)."""
-    if show_new_name:
-        st.text_input("새 모델 이름(선택)", key="model_name_input", placeholder="예: 2월_정상라인A")
-        st.divider()
-    st.header("📁 저장된 모델")
+def render_model_registry(models_dir, df_for_compat=None):
+    """'저장된 모델' 섹션(우측 화면용): 선택·호환배지·편집·삭제."""
+    st.subheader("📁 저장된 모델")
     models = REG.list_models(models_dir)
     if not models:
         st.caption("아직 없음 — '모델 생성'에서 학습하면 저장됩니다.")
@@ -756,6 +756,17 @@ def page_eda(cfg, ts_col, exclude):
                     _set_data(pd.read_csv(up), up.name)
                 except Exception as e:  # noqa: BLE001
                     st.error(f"CSV 읽기 실패: {e}")
+        st.caption("또는 준비된 샘플 내려받아 업로드:")
+        dcols = st.columns(2)
+        for i, (fname, capd) in enumerate([
+                ("sample_sensor.csv", "행 단위(정상+이상+label)"),
+                ("sample_timeseries.csv", "시계열 → LSTM 데모")]):
+            p = os.path.join(ROOT, "samples", fname)
+            if os.path.exists(p):
+                with open(p, "rb") as fp:
+                    dcols[i].download_button(f"⬇ {fname}", fp.read(), file_name=fname,
+                                             mime="text/csv", use_container_width=True,
+                                             help=capd)
     with tab_gen:
         g = st.columns(4)
         kind = g[0].selectbox("유형", ["행 단위", "시계열(자기상관)"], key="gen_kind")
@@ -830,6 +841,7 @@ def page_train(cfg, models_dir, label_col, ts_col, exclude):
     settings = {"epochs": set_epochs, "bottleneck": set_bottleneck,
                 "percentile": set_pct, "lr": set_lr}
 
+    st.text_input("새 모델 이름(선택)", key="model_name_input", placeholder="예: 2월_정상라인A")
     if st.button("🚀 학습 시작", type="primary"):
         if recommend_ts:
             ts_dialog(default_window=20)
@@ -863,10 +875,12 @@ def page_train(cfg, models_dir, label_col, ts_col, exclude):
 
 def page_eval(cfg, models_dir, label_col):
     st.header("📊 3. 모델 평가")
+    render_model_registry(models_dir)   # 평가할 모델 선택·관리(우측)
+    st.divider()
     active = st.session_state.get("active_model_dir")
     det = get_detector(active) if (active and os.path.isdir(active)) else None
     if det is None:
-        st.info("좌측 **'저장된 모델'** 에서 평가할 모델을 선택하세요. "
+        st.info("위 **'저장된 모델'** 에서 평가할 모델을 선택하세요. "
                 "(모델이 없으면 '모델 생성'에서 먼저 학습)")
         return
     name = REG.read_entry_info(active).get("name", os.path.basename(active))
@@ -946,32 +960,13 @@ def main():
     os.makedirs(models_dir, exist_ok=True)
     REG.prune_incomplete(models_dir)
 
-    # ---- 좌측 메뉴 + 컨텍스트(모델 레지스트리/샘플) ----
+    # ---- 좌측: 메뉴 내비게이터(만) ----
     with st.sidebar:
         st.header("메뉴")
         page = st.radio("메뉴", [MENU_EDA, MENU_TRAIN, MENU_EVAL, MENU_MON],
                         label_visibility="collapsed", key="menu")
-        st.divider()
-        if page in (MENU_TRAIN, MENU_EVAL):
-            data_df = st.session_state.get("data_df")
-            sidebar_registry(models_dir,
-                             df_for_compat=(data_df if page == MENU_TRAIN else None),
-                             show_new_name=(page == MENU_TRAIN))
-            st.divider()
-        st.header("📄 샘플 데이터")
-        for fname, capd in [("sample_sensor.csv", "행 단위(정상+이상+label)"),
-                            ("sample_timeseries.csv", "시계열(자기상관 강함) → LSTM 데모")]:
-            p = os.path.join(ROOT, "samples", fname)
-            if os.path.exists(p):
-                with open(p, "rb") as fp:
-                    st.download_button(f"⬇ {fname}", fp.read(), file_name=fname,
-                                       mime="text/csv", use_container_width=True)
-
-    # 활성 모델 변경 시 임계값 슬라이더 초기화
-    active = st.session_state.get("active_model_dir")
-    if st.session_state.get("_last_active") != active:
-        st.session_state.pop("thr_slider", None)
-        st.session_state["_last_active"] = active
+        st.caption("메뉴를 선택하면 우측에 해당 화면이 표시됩니다.\n\n"
+                   "EDA → 모델 생성 → 모델 평가 순으로 진행하세요.")
 
     # ---- 라우팅 ----
     if page == MENU_EDA:
