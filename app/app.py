@@ -928,25 +928,109 @@ def page_eval(cfg, models_dir, label_col):
         render_comparison(models_dir, cdf, label_col)
 
 
-def page_monitor():
+def page_monitor(cfg, models_dir, label_col):
+    from src import monitoring as MON
     st.header("📈 4. 모델 성능 모니터링")
-    st.info("🚧 추후 개발 예정 — 운영 단계에서 모델 성능 저하를 조기 감지하기 위한 기능입니다.")
-    st.markdown(
-        "- **드리프트 감지**: 신규 데이터의 재구성 오차 분포가 학습 대비 이동하면 경고\n"
-        "- **시간별 이상률 추이**: 기간별 이상 탐지 비율·평균 오차 트렌드\n"
-        "- **재학습 트리거**: 임계 초과 시 재학습 권고/자동화(사내 스케줄러 연계)\n"
-        "- **알림**: 임계 초과 시 이메일/사내 메신저 통지\n\n"
-        "설계: `docs/migration_notes.md §8`, `ROADMAP.md P3` 참고.")
+    render_model_registry(models_dir)
     st.divider()
-    st.caption("예시(개발 예정) — 시간에 따른 평균 재구성 오차 추이 & 드리프트 임계")
-    x = list(range(30))
-    base = [0.02 + 0.0004 * i + (0.002 if i > 22 else 0) * (i - 22) for i in x]
+    active = st.session_state.get("active_model_dir")
+    det = get_detector(active) if (active and os.path.isdir(active)) else None
+    if det is None:
+        st.info("위 **'저장된 모델'** 에서 모니터링할 모델을 선택하세요.")
+        return
+    name = REG.read_entry_info(active).get("name", os.path.basename(active))
+    base_mean = det.threshold_detail.get("train_error_mean")
+    base_std = det.threshold_detail.get("train_error_std")
+    thr = float(det.threshold)
+    st.success(f"모니터링 대상 모델: **{name}** · 학습 기준 평균오차 "
+               f"{(base_mean or 0):.5f} · σ {(base_std or 0):.5f} · 임계값 {thr:.5f}")
+
+    up = st.file_uploader("모니터링(운영) 데이터 CSV 업로드", type=["csv"], key="mon_upload")
+    if up is None:
+        st.info("운영 데이터를 업로드하면 **시간대별 재구성 오차·이상률 추이**와 "
+                "**학습 기준 대비 드리프트**를 분석합니다. (라벨 불필요) "
+                "타임스탬프 컬럼이 있으면 시간축으로, 없으면 순서 구간으로 표시합니다.")
+        return
+    try:
+        mdf = pd.read_csv(up)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"CSV 읽기 실패: {e}")
+        return
+    ok, missing = _compat(active, mdf.columns)
+    if not ok:
+        st.error(f"모델과 데이터 스키마가 다릅니다 — 누락 컬럼: {', '.join(missing[:6])}")
+        return
+
+    ctl = st.columns(2)
+    n_windows = ctl[0].slider("구간 수", 5, 100, 30, key="mon_windows")
+    k = ctl[1].slider("드리프트 민감도 k (σ)", 1.0, 5.0, 3.0, 0.5, key="mon_k")
+
+    try:
+        res = det.predict(mdf)
+    except ValueError as e:
+        st.error(f"판정 실패: {e}")
+        return
+
+    ts_col = det.schema.timestamp_column
+    timestamps = mdf[ts_col] if (ts_col and ts_col in mdf.columns) else None
+    wm = MON.windowed_metrics(res.errors, res.predictions, timestamps, n_windows)
+    ds = MON.drift_summary(res.errors, base_mean, base_std, k)
+
+    # KPI
+    kc = st.columns(4)
+    kc[0].metric("전체 샘플", f"{len(mdf):,}")
+    kc[1].metric("이상률", f"{res.predictions.mean() * 100:.1f}%")
+    kc[2].metric("평균 재구성 오차", f"{ds['cur_mean']:.5f}",
+                 f"{ds['cur_mean'] - ds['base_mean']:+.5f} vs 기준")
+    emoji = {"정상": "🟢 정상", "주의": "🟡 주의", "경고": "🔴 경고"}[ds["status"]]
+    kc[3].metric("드리프트 상태", emoji, f"z={ds['z']:.1f}σ")
+
+    if ds["status"] == "경고":
+        st.error(f"⚠️ 드리프트 경고 — 평균 오차가 학습 기준 대비 {ds['z']:.1f}σ 상승"
+                 f"(임계 {k}σ). 정상 상태 변화 가능성 → **재학습 검토**.")
+    elif ds["status"] == "주의":
+        st.warning(f"드리프트 주의 — 오차가 다소 상승했습니다(z={ds['z']:.1f}σ).")
+    else:
+        st.success("드리프트 정상 — 학습 기준 분포와 유사합니다.")
+
+    # 구간별 평균 오차 추이
+    st.subheader("구간별 평균 재구성 오차 추이")
+    x = wm["label"]
+    drift_mask = wm["mean_error"] > ds["drift_line"]
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=base, name="평균 오차", line=dict(color=NORMAL_C)))
-    fig.add_hline(y=0.035, line_dash="dash", line_color=ANOM_C, annotation_text="드리프트 임계")
-    fig.update_layout(height=300, xaxis_title="일(day)", yaxis_title="평균 재구성 오차",
+    fig.add_trace(go.Scatter(x=x, y=wm["mean_error"], mode="lines+markers",
+                             name="구간 평균 오차", line=dict(color=NORMAL_C)))
+    if drift_mask.any():
+        fig.add_trace(go.Scatter(x=x[drift_mask], y=wm["mean_error"][drift_mask],
+                                 mode="markers", name="드리프트 구간",
+                                 marker=dict(color=ANOM_C, size=10, symbol="x")))
+    fig.add_hline(y=ds["base_mean"], line_dash="dot", line_color="gray",
+                  annotation_text="학습 평균")
+    fig.add_hline(y=thr, line_dash="dash", line_color="#e6550d", annotation_text="임계값")
+    if ds["base_std"] > 0:
+        fig.add_hline(y=ds["drift_line"], line_dash="dash", line_color=ANOM_C,
+                      annotation_text=f"드리프트 임계({k}σ)")
+    fig.update_layout(height=340, xaxis_title="구간(시간/순서)", yaxis_title="평균 오차",
                       legend=dict(orientation="h"))
     st.plotly_chart(fig, use_container_width=True)
+    _note("구간 평균 오차가 학습 평균 위로 지속 상승하면 드리프트 신호입니다. "
+          "드리프트 임계를 넘는 구간은 X로 표시됩니다. → 재학습/점검 판단에 활용.")
+
+    # 구간별 이상 탐지율
+    st.subheader("구간별 이상 탐지율")
+    bar = px.bar(wm.assign(anomaly_pct=wm["anomaly_rate"] * 100), x="label", y="anomaly_pct")
+    bar.update_traces(marker_color=NORMAL_C)
+    bar.update_layout(height=300, xaxis_title="구간", yaxis_title="이상률(%)")
+    st.plotly_chart(bar, use_container_width=True)
+
+    # 구간 표 & 다운로드
+    with st.expander("구간별 상세 표"):
+        show = wm.copy()
+        show["anomaly_rate(%)"] = (show["anomaly_rate"] * 100).round(1)
+        show = show.drop(columns=["anomaly_rate"])
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.download_button("구간 요약 CSV", show.to_csv(index=False).encode("utf-8-sig"),
+                           "monitoring_windows.csv", "text/csv")
 
 
 def main():
@@ -976,7 +1060,7 @@ def main():
     elif page == MENU_EVAL:
         page_eval(cfg, models_dir, label_col)
     else:
-        page_monitor()
+        page_monitor(cfg, models_dir, label_col)
 
 
 if __name__ == "__main__":
