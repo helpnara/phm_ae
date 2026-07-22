@@ -522,7 +522,8 @@ def _run_comparison(paths, df, label_col):
             entry["pr"] = pr_curve_points(df[label_col].values, res.errors)
         rows.append(row)
         curves.append(entry)
-    st.session_state["cmp_result"] = {"rows": rows, "curves": curves, "has_label": has_label}
+    st.session_state["cmp_result"] = {"rows": rows, "curves": curves,
+                                      "has_label": has_label, "paths": list(paths)}
 
 
 def _render_comparison_result():
@@ -569,6 +570,23 @@ def _render_comparison_result():
         _note("라벨이 없어 지표 비교는 생략됩니다. 모델별 이상 탐지 비율을 비교합니다. "
               "라벨 컬럼이 있으면 F1·ROC/PR로 정량 비교됩니다.")
 
+    # 비교 결과에서 최고/원하는 모델을 바로 활성으로 지정
+    paths = r.get("paths", [])
+    names = [row["모델"] for row in r["rows"]]
+    if paths:
+        best_idx = 0
+        if r["has_label"]:
+            best_idx = int(np.argmax([(row.get("F1") or 0) for row in r["rows"]]))
+        a1, a2 = st.columns([3, 1])
+        pick = a1.selectbox("활성으로 지정할 모델 (기본=최고 성능)", list(range(len(paths))),
+                            index=best_idx, format_func=lambda i: names[i], key="cmp_activate_pick")
+        if a2.button("✅ 활성으로 지정", use_container_width=True):
+            st.session_state["active_model_dir"] = paths[pick]
+            st.session_state["model_select"] = paths[pick]
+            st.session_state.pop("thr_slider", None)
+            st.rerun()
+        st.caption("지정하면 상단 '학습 결과'·'단건 수동 판정'과 사이드바 선택이 그 모델로 바뀝니다.")
+
 
 def render_comparison(models_dir, df, label_col):
     """저장된 모델들을 현재 데이터로 비교한다(호환 모델만)."""
@@ -594,6 +612,54 @@ def render_comparison(models_dir, df, label_col):
         with st.spinner("선택 모델을 현재 데이터로 실행 중..."):
             _run_comparison(sel, df, label_col)
     _render_comparison_result()
+
+
+# ----------------------------- 단건 수동 판정 -----------------------------
+
+def render_manual(detector):
+    """센서 값을 직접 입력해 즉시 정상/이상을 판정한다(CSV 불필요)."""
+    st.caption("활성 모델로 센서 값을 직접 입력해 즉시 판정합니다. 기본값은 정상 학습데이터 평균입니다.")
+    if detector.model_type == "lstm":
+        st.info("시계열(LSTM) 모델은 단건 입력을 지원하지 않습니다(연속 구간이 필요). "
+                "행 단위(Dense) 모델을 선택하세요.")
+        return
+
+    feats = detector.schema.feature_columns
+    means = getattr(detector.scaler, "mean_", None)
+    scales = getattr(detector.scaler, "scale_", None)
+    ncol = min(len(feats), 4)
+    cols = st.columns(ncol)
+    vals = {}
+    for i, f in enumerate(feats):
+        default = float(means[i]) if means is not None else 0.0
+        step = float(scales[i] / 10) if scales is not None else 0.1
+        vals[f] = cols[i % ncol].number_input(f, value=round(default, 4),
+                                               step=round(step, 4), format="%.4f",
+                                               key=f"manual_{f}")
+
+    if st.button("🔎 판정", type="primary"):
+        row = pd.DataFrame([vals])
+        try:
+            res = detector.predict(row)
+        except ValueError as e:
+            st.error(f"판정 실패: {e}")
+            return
+        err = float(res.errors[0])
+        pred = int(res.predictions[0])
+        thr = float(detector.threshold)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("판정", "이상 ⚠️" if pred == 1 else "정상 ✅")
+        m2.metric("이상 점수", f"{err / thr:.2f}", help="1.0 초과 = 이상")
+        m3.metric("재구성 오차", f"{err:.5f}", help=f"임계값 {thr:.5f}")
+        pfe = res.per_feature_error[0]
+        dd = pd.DataFrame({"feature": feats, "squared_error": pfe}) \
+            .sort_values("squared_error", ascending=False)
+        fig = px.bar(dd, x="squared_error", y="feature", orientation="h",
+                     color_discrete_sequence=[ANOM_C if pred else NORMAL_C])
+        fig.update_layout(height=260, yaxis=dict(autorange="reversed"),
+                          margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        _note("오차가 큰 피처가 정상 패턴에서 벗어난 센서입니다. 이상 판정 시 해당 센서를 우선 점검하세요.")
 
 
 # ----------------------------- 메인 -----------------------------
@@ -764,6 +830,16 @@ def main():
             except ValueError as e:
                 st.error(f"선택한 모델과 업로드 데이터의 스키마가 맞지 않습니다.\n\n{e}\n\n"
                          f"같은 컬럼 구성의 CSV를 올리거나 새로 학습하세요.")
+
+    # ===== 단건 수동 판정 프레임 =====
+    st.markdown("#### ⌨️ 단건 수동 판정")
+    with st.container(border=True):
+        _active = st.session_state.get("active_model_dir")
+        _det = get_detector(_active) if (_active and os.path.isdir(_active)) else None
+        if _det is None:
+            st.info("먼저 학습하거나 좌측 **'저장된 모델'** 에서 선택하면 단건 판정이 가능합니다.")
+        else:
+            render_manual(_det)
 
     # ===== 모델 비교 프레임 =====
     st.markdown("#### 📊 모델 비교")
