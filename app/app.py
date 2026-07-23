@@ -541,6 +541,8 @@ def _render_comparison_result():
                      .format(precision=3), use_container_width=True)
     else:
         st.dataframe(tbl, use_container_width=True)
+    st.download_button("비교 결과 CSV", tbl.reset_index().to_csv(index=False).encode("utf-8-sig"),
+                       "model_comparison.csv", "text/csv")
 
     palette = ["#2c7fb8", "#d7301f", "#238b45", "#e6550d", "#6a51a3", "#08519c"]
     if r["has_label"]:
@@ -597,16 +599,22 @@ def render_comparison(models_dir, df, label_col):
     if len(models) < 2:
         st.info("저장된 모델이 2개 이상일 때 비교할 수 있습니다. (좌측에서 학습을 더 진행하세요)")
         return
-    compat = []
+    compat, incompat = [], []
     for m in models:
-        ok, _ = _compat(m["path"], df.columns)
-        if ok:
-            compat.append(m)
-    st.caption(f"전체 {len(models)}개 중 현재 데이터와 **호환 {len(compat)}개**. 호환 모델만 비교 대상입니다.")
-    if len(compat) < 2:
+        ok, miss = _compat(m["path"], df.columns)
+        (compat if ok else incompat).append((m, miss))
+    compat_models = [m for m, _ in compat]
+    st.caption(f"전체 {len(models)}개 중 현재 데이터와 **호환 {len(compat_models)}개**. 호환 모델만 비교 대상입니다.")
+    if incompat:
+        with st.expander(f"⚠️ 비호환 모델 {len(incompat)}개 (비교 제외)"):
+            for m, miss in incompat:
+                st.caption(f"• {m['name']} — 누락 컬럼: {', '.join(miss[:5])}"
+                           f"{'…' if len(miss) > 5 else ''}")
+    if len(compat_models) < 2:
         st.warning("현재 업로드 데이터와 호환되는 모델이 2개 미만입니다. "
                    "같은 컬럼 구성의 데이터를 올리거나 해당 데이터로 학습하세요.")
         return
+    compat = compat_models
     paths = [m["path"] for m in compat]
     labels = {m["path"]: _model_label(m) for m in compat}
     sel = st.multiselect("비교할 모델 선택", paths, default=paths[:min(3, len(paths))],
@@ -696,8 +704,19 @@ def render_model_registry(models_dir, df_for_compat=None):
     if not models:
         st.caption("아직 없음 — '모델 생성'에서 학습하면 저장됩니다.")
         return
-    paths = [m["path"] for m in models]
-    labels = {m["path"]: _model_label(m) for m in models}
+    # 정렬 · 태그 필터
+    all_tags = sorted({t for m in models for t in (m.get("tags") or [])})
+    fc = st.columns([1, 2])
+    sort_by = fc[0].selectbox("정렬", ["최신순", "F1순"], key="reg_sort")
+    sel_tags = fc[1].multiselect("태그 필터", all_tags, key="reg_tags") if all_tags else []
+    view = [m for m in models if (not sel_tags or set(sel_tags) & set(m.get("tags") or []))]
+    if sort_by == "F1순":
+        view = sorted(view, key=lambda m: (m.get("metrics") or {}).get("f1") or -1.0, reverse=True)
+    if not view:
+        st.caption("필터에 해당하는 모델이 없습니다.")
+        return
+    paths = [m["path"] for m in view]
+    labels = {m["path"]: _model_label(m) for m in view}
     if st.session_state.get("model_select") not in paths:
         act = st.session_state.get("active_model_dir")
         st.session_state["model_select"] = act if act in paths else paths[0]
@@ -976,18 +995,24 @@ def page_monitor(cfg, models_dir, label_col):
     ts_col = det.schema.timestamp_column
     has_ts = bool(ts_col) and ts_col in mdf.columns
     freq_map = {"자동 구간": None, "시간(H)": "h", "일(D)": "d", "주(W)": "w"}
-    ctl = st.columns(3)
+    method_map = {"z-score (평균 이동)": "zscore", "PSI (분포 안정성)": "psi",
+                  "KS 검정 (분포 동일성)": "ks"}
+    ctl = st.columns(4)
     grp = ctl[0].selectbox("구간 기준", list(freq_map.keys()),
                            disabled=not has_ts, key="mon_grp",
                            help="타임스탬프가 있을 때 시간 주기로 리샘플합니다.")
-    n_windows = ctl[1].slider("구간 수(자동 구간)", 5, 100, 30, key="mon_windows")
-    k = ctl[2].slider("드리프트 민감도 k (σ)", 1.0, 5.0, 3.0, 0.5, key="mon_k")
+    method_label = ctl[1].selectbox("드리프트 판정 방식", list(method_map.keys()), key="mon_method")
+    n_windows = ctl[2].slider("구간 수(자동 구간)", 5, 100, 30, key="mon_windows")
+    k = ctl[3].slider("드리프트 민감도 k (σ, z-score)", 1.0, 5.0, 3.0, 0.5, key="mon_k")
     freq = freq_map[grp] if has_ts else None
+    method = method_map[method_label]
 
-    # 기준선(baseline) 재설정: 정상 기준 데이터로 대체(선택)
+    # 기준선(baseline): 학습 시 저장분(PSI/KS 분포) 또는 정상 기준 데이터로 재설정
     base_src = "학습 시점 통계"
+    baseline_errors = det.baseline_errors
     with st.expander("⚙️ 기준선(baseline) 재설정 (선택)"):
-        st.caption("정상 기준 데이터를 올리면 그 데이터의 재구성 오차 평균±σ를 기준으로 드리프트를 판단합니다.")
+        st.caption("정상 기준 데이터를 올리면 그 데이터의 재구성 오차 분포를 기준으로 드리프트를 판단합니다. "
+                   "(PSI/KS는 기준 분포가 필요 — 구버전 모델은 여기서 정상 데이터를 올리세요.)")
         bref = st.file_uploader("정상 기준 데이터 CSV", type=["csv"], key="mon_baseline")
         if bref is not None:
             try:
@@ -999,6 +1024,7 @@ def page_monitor(cfg, models_dir, label_col):
                     bres = det.predict(bdf)
                     bl = MON.baseline_from_errors(bres.errors)
                     base_mean, base_std = bl["mean"], bl["std"]
+                    baseline_errors = bres.errors
                     base_src = f"기준 데이터({bref.name}, {len(bdf):,}행)"
                     st.success(f"기준선 재설정: 평균 {base_mean:.5f} · σ {base_std:.5f}")
             except Exception as e:  # noqa: BLE001
@@ -1012,29 +1038,32 @@ def page_monitor(cfg, models_dir, label_col):
 
     timestamps = mdf[ts_col] if has_ts else None
     wm = MON.windowed_metrics(res.errors, res.predictions, timestamps, n_windows, freq)
-    ds = MON.drift_summary(res.errors, base_mean, base_std, k)
-    st.caption(f"기준선 출처: {base_src}")
+    ds = MON.drift_summary(res.errors, base_mean, base_std, k)  # 차트 기준선용
+    assess = MON.assess_drift(method, res.errors, base_mean, base_std, baseline_errors, k)
+    if assess.get("unavailable"):
+        st.warning(f"**{method_label}**은 기준 오차 분포가 필요합니다. 아래 '기준선 재설정'에서 "
+                   "정상 데이터를 올리거나, 모델을 새로 학습(자동 저장)하세요. → 임시로 z-score로 표시합니다.")
+        assess = MON.assess_drift("zscore", res.errors, base_mean, base_std, None, k)
+    st.caption(f"기준선 출처: {base_src} · 판정 방식: {assess['method']}")
 
     # KPI
     kc = st.columns(4)
     kc[0].metric("전체 샘플", f"{len(mdf):,}")
     kc[1].metric("이상률", f"{res.predictions.mean() * 100:.1f}%")
-    kc[2].metric("평균 재구성 오차", f"{ds['cur_mean']:.5f}",
-                 f"{ds['cur_mean'] - ds['base_mean']:+.5f} vs 기준")
-    emoji = {"정상": "🟢 정상", "주의": "🟡 주의", "경고": "🔴 경고"}[ds["status"]]
-    kc[3].metric("드리프트 상태", emoji, f"z={ds['z']:.1f}σ")
+    kc[2].metric(f"드리프트 지표({assess['method']})", f"{assess['value']:.3f}")
+    emoji = {"정상": "🟢 정상", "주의": "🟡 주의", "경고": "🔴 경고"}[assess["status"]]
+    kc[3].metric("드리프트 상태", emoji)
 
-    if ds["status"] == "경고":
-        st.error(f"⚠️ 드리프트 경고 — 평균 오차가 학습 기준 대비 {ds['z']:.1f}σ 상승"
-                 f"(임계 {k}σ). 정상 상태 변화 가능성 → **재학습 검토**.")
+    if assess["status"] == "경고":
+        st.error(f"⚠️ 드리프트 경고 — {assess['text']}. 정상 상태 변화 가능성 → **재학습 검토**.")
         with st.container(border=True):
             st.markdown("**🔁 재학습 권고** — 최근 정상 운전 데이터로 모델을 다시 학습하세요.")
-            st.caption("① '모델 생성' 메뉴에서 최근 정상 데이터로 재학습 → ② 이 화면에서 새 모델로 재점검. "
-                       "(자동 재학습·알림 연동은 후속 예정)")
-    elif ds["status"] == "주의":
-        st.warning(f"드리프트 주의 — 오차가 다소 상승했습니다(z={ds['z']:.1f}σ). 추이를 지켜보세요.")
+            st.caption("① 알림·원인 분석 후 → ② '모델 생성'에서 최근 정상 데이터로 재학습 → "
+                       "③ 이 화면에서 새 모델로 재점검. (자동 재학습·알림은 현장 적용 단계에서 연동)")
+    elif assess["status"] == "주의":
+        st.warning(f"드리프트 주의 — {assess['text']}. 추이를 지켜보세요.")
     else:
-        st.success("드리프트 정상 — 학습 기준 분포와 유사합니다.")
+        st.success(f"드리프트 정상 — {assess['text']}. 학습 기준 분포와 유사합니다.")
 
     # 구간별 평균 오차 추이
     st.subheader("구간별 평균 재구성 오차 추이")

@@ -69,6 +69,15 @@ class AnomalyDetector:
         meta = D.load_meta(artifacts_dir)
         self.model_type = meta.get("model_type", "dense")
         self.window = meta.get("window")
+        # baseline 오차 분포(드리프트 PSI/KS용). 구버전 모델엔 없을 수 있음.
+        import json
+        import numpy as _np
+        bp = os.path.join(artifacts_dir, "baseline_errors.json")
+        if os.path.exists(bp):
+            with open(bp, encoding="utf-8") as f:
+                self.baseline_errors = _np.asarray(json.load(f).get("errors", []), dtype=float)
+        else:
+            self.baseline_errors = None
 
     def predict(self, df: pd.DataFrame, threshold: Optional[float] = None) -> DetectionResult:
         """DataFrame을 판정한다. threshold를 주면 저장값 대신 사용(인터랙티브)."""

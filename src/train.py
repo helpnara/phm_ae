@@ -129,6 +129,13 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
             "val_loss": [float(v) for v in history.history.get("val_loss", [])],
         }, f)
 
+    # baseline 재구성 오차 분포 저장(드리프트 PSI/KS 검정용, 최대 2000개 다운샘플)
+    rng = np.random.default_rng(seed)
+    base_sample = (errors if len(errors) <= 2000
+                   else rng.choice(errors, 2000, replace=False))
+    with open(os.path.join(artifacts_dir, "baseline_errors.json"), "w", encoding="utf-8") as f:
+        json.dump({"errors": [float(v) for v in base_sample]}, f)
+
     if verbose:
         print(f"[train] 아티팩트 저장 완료: {os.path.abspath(artifacts_dir)}")
     return artifacts_dir
