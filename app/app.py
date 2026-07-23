@@ -738,6 +738,18 @@ def render_model_registry(models_dir, df_for_compat=None):
             st.session_state.pop(k, None)
         st.rerun()
 
+    with st.expander("📦 모델 내보내기 / 가져오기 (사내 이관)"):
+        st.download_button("전체 모델 zip 내보내기", REG.export_all(models_dir),
+                           "phm_models.zip", "application/zip", use_container_width=True)
+        imp = st.file_uploader("모델 zip 가져오기", type=["zip"], key="reg_import")
+        if imp is not None and st.button("가져오기 실행", use_container_width=True):
+            try:
+                n = REG.import_zip(models_dir, imp.read())
+                st.success(f"가져오기 완료 — 현재 모델 {n}개.")
+                st.rerun()
+            except Exception as e:  # noqa: BLE001
+                st.error(f"가져오기 실패: {e}")
+
 
 def page_eda(cfg, ts_col, exclude):
     from src.generate_synthetic import build_tabular_df, build_timeseries_df
@@ -961,9 +973,36 @@ def page_monitor(cfg, models_dir, label_col):
         st.error(f"모델과 데이터 스키마가 다릅니다 — 누락 컬럼: {', '.join(missing[:6])}")
         return
 
-    ctl = st.columns(2)
-    n_windows = ctl[0].slider("구간 수", 5, 100, 30, key="mon_windows")
-    k = ctl[1].slider("드리프트 민감도 k (σ)", 1.0, 5.0, 3.0, 0.5, key="mon_k")
+    ts_col = det.schema.timestamp_column
+    has_ts = bool(ts_col) and ts_col in mdf.columns
+    freq_map = {"자동 구간": None, "시간(H)": "h", "일(D)": "d", "주(W)": "w"}
+    ctl = st.columns(3)
+    grp = ctl[0].selectbox("구간 기준", list(freq_map.keys()),
+                           disabled=not has_ts, key="mon_grp",
+                           help="타임스탬프가 있을 때 시간 주기로 리샘플합니다.")
+    n_windows = ctl[1].slider("구간 수(자동 구간)", 5, 100, 30, key="mon_windows")
+    k = ctl[2].slider("드리프트 민감도 k (σ)", 1.0, 5.0, 3.0, 0.5, key="mon_k")
+    freq = freq_map[grp] if has_ts else None
+
+    # 기준선(baseline) 재설정: 정상 기준 데이터로 대체(선택)
+    base_src = "학습 시점 통계"
+    with st.expander("⚙️ 기준선(baseline) 재설정 (선택)"):
+        st.caption("정상 기준 데이터를 올리면 그 데이터의 재구성 오차 평균±σ를 기준으로 드리프트를 판단합니다.")
+        bref = st.file_uploader("정상 기준 데이터 CSV", type=["csv"], key="mon_baseline")
+        if bref is not None:
+            try:
+                bdf = pd.read_csv(bref)
+                bok, bmiss = _compat(active, bdf.columns)
+                if not bok:
+                    st.error(f"기준 데이터 스키마 불일치 — 누락: {', '.join(bmiss[:6])}")
+                else:
+                    bres = det.predict(bdf)
+                    bl = MON.baseline_from_errors(bres.errors)
+                    base_mean, base_std = bl["mean"], bl["std"]
+                    base_src = f"기준 데이터({bref.name}, {len(bdf):,}행)"
+                    st.success(f"기준선 재설정: 평균 {base_mean:.5f} · σ {base_std:.5f}")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"기준 데이터 처리 실패: {e}")
 
     try:
         res = det.predict(mdf)
@@ -971,10 +1010,10 @@ def page_monitor(cfg, models_dir, label_col):
         st.error(f"판정 실패: {e}")
         return
 
-    ts_col = det.schema.timestamp_column
-    timestamps = mdf[ts_col] if (ts_col and ts_col in mdf.columns) else None
-    wm = MON.windowed_metrics(res.errors, res.predictions, timestamps, n_windows)
+    timestamps = mdf[ts_col] if has_ts else None
+    wm = MON.windowed_metrics(res.errors, res.predictions, timestamps, n_windows, freq)
     ds = MON.drift_summary(res.errors, base_mean, base_std, k)
+    st.caption(f"기준선 출처: {base_src}")
 
     # KPI
     kc = st.columns(4)
@@ -988,8 +1027,12 @@ def page_monitor(cfg, models_dir, label_col):
     if ds["status"] == "경고":
         st.error(f"⚠️ 드리프트 경고 — 평균 오차가 학습 기준 대비 {ds['z']:.1f}σ 상승"
                  f"(임계 {k}σ). 정상 상태 변화 가능성 → **재학습 검토**.")
+        with st.container(border=True):
+            st.markdown("**🔁 재학습 권고** — 최근 정상 운전 데이터로 모델을 다시 학습하세요.")
+            st.caption("① '모델 생성' 메뉴에서 최근 정상 데이터로 재학습 → ② 이 화면에서 새 모델로 재점검. "
+                       "(자동 재학습·알림 연동은 후속 예정)")
     elif ds["status"] == "주의":
-        st.warning(f"드리프트 주의 — 오차가 다소 상승했습니다(z={ds['z']:.1f}σ).")
+        st.warning(f"드리프트 주의 — 오차가 다소 상승했습니다(z={ds['z']:.1f}σ). 추이를 지켜보세요.")
     else:
         st.success("드리프트 정상 — 학습 기준 분포와 유사합니다.")
 

@@ -11,28 +11,39 @@ import numpy as np
 import pandas as pd
 
 
+_FREQ_FMT = {"h": "%m-%d %H시", "d": "%m-%d", "w": "%m-%d주"}
+
+
 def windowed_metrics(errors: np.ndarray, predictions: np.ndarray,
                      timestamps: Optional[pd.Series] = None,
-                     n_windows: int = 30) -> pd.DataFrame:
+                     n_windows: int = 30, freq: Optional[str] = None) -> pd.DataFrame:
     """구간별 평균 오차·이상률·건수를 집계한다.
 
-    timestamps가 유효하면 시간 범위를 n_windows개 등간격으로 나누고,
-    아니면 행 순서를 n_windows개 균등 청크로 나눈다.
+    freq(h/d/w)가 주어지고 timestamps가 유효하면 시간 주기로 리샘플하고,
+    아니면 timestamps 유효 시 등간격 n_windows개, 그것도 없으면 순서 청크로 나눈다.
     반환 컬럼: label, mean_error, anomaly_rate(0~1), count
     """
     df = pd.DataFrame({"error": np.asarray(errors, dtype=float),
                        "pred": np.asarray(predictions, dtype=int)})
-    use_time = False
+    t = None
     if timestamps is not None:
-        t = pd.to_datetime(pd.Series(timestamps).reset_index(drop=True), errors="coerce")
-        if t.notna().sum() > 1 and t.nunique() > 1:
-            df["t"] = t.values
-            df = df.sort_values("t").reset_index(drop=True)
-            use_time = True
+        tt = pd.to_datetime(pd.Series(timestamps).reset_index(drop=True), errors="coerce")
+        if tt.notna().sum() > 1 and tt.nunique() > 1:
+            t = tt
 
     n = len(df)
+    if t is not None and freq in _FREQ_FMT:
+        df["t"] = t.values
+        g = df.set_index("t").resample(freq).agg(
+            mean_error=("error", "mean"), anomaly_rate=("pred", "mean"), count=("error", "size"))
+        agg = g[g["count"] > 0].reset_index()
+        agg["label"] = agg["t"].dt.strftime(_FREQ_FMT[freq])
+        return agg[["label", "mean_error", "anomaly_rate", "count"]]
+
     bins = max(min(int(n_windows), n), 1)
-    if use_time:
+    if t is not None:
+        df["t"] = t.values
+        df = df.sort_values("t").reset_index(drop=True)
         ticks = df["t"].astype("int64")
         df["win"] = pd.cut(ticks, bins=bins, labels=False, include_lowest=True)
         agg = df.groupby("win", dropna=True).agg(
@@ -46,6 +57,13 @@ def windowed_metrics(errors: np.ndarray, predictions: np.ndarray,
             count=("error", "size")).reset_index()
         agg["label"] = "구간 " + (agg["win"] + 1).astype(str)
     return agg[["label", "mean_error", "anomaly_rate", "count"]]
+
+
+def baseline_from_errors(errors: np.ndarray) -> Dict[str, float]:
+    """기준 데이터의 재구성 오차로부터 baseline(평균·표준편차)을 산출한다."""
+    e = np.asarray(errors, dtype=float)
+    return {"mean": float(e.mean()) if len(e) else 0.0,
+            "std": float(e.std()) if len(e) else 0.0}
 
 
 def drift_summary(errors: np.ndarray, base_mean: Optional[float],

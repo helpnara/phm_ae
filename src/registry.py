@@ -9,11 +9,13 @@
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import time
 import uuid
+import zipfile
 from typing import Any, Dict, List, Optional
 
 from src.data import MODEL_FILE, load_meta
@@ -90,6 +92,33 @@ def list_models(models_dir: str) -> List[Dict[str, Any]]:
 
 def delete_model(entry_dir: str) -> None:
     shutil.rmtree(entry_dir, ignore_errors=True)
+
+
+def export_all(models_dir: str) -> bytes:
+    """레지스트리 전체(모든 모델 폴더)를 zip 바이트로 묶는다(사내 이관용)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _dirs, files in os.walk(models_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                arc = os.path.relpath(fp, models_dir)
+                z.write(fp, arc)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def import_zip(models_dir: str, data: bytes) -> int:
+    """zip을 레지스트리에 병합 추출한다. 반영된(모델 파일 보유) 항목 수를 반환한다."""
+    os.makedirs(models_dir, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        # 경로 탈출 방지
+        for name in z.namelist():
+            dest = os.path.normpath(os.path.join(models_dir, name))
+            if not dest.startswith(os.path.abspath(models_dir) + os.sep) \
+                    and not dest.startswith(models_dir + os.sep):
+                raise ValueError(f"안전하지 않은 경로: {name}")
+        z.extractall(models_dir)
+    return len(list_models(models_dir))
 
 
 def prune_incomplete(models_dir: str) -> int:
