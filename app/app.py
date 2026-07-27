@@ -734,6 +734,103 @@ def render_time_split_validation(df, cfg, models_dir, label_col, ts_col):
     render_protocol_metrics(tdf, tdf[label_col].values, np.array(r["pred"]), ts_col)
 
 
+# ----------------------------- 임계값 정책 -----------------------------
+
+def render_threshold_policy(det, active, label_col):
+    """운영 목표(오경보 허용량·비용)에서 임계값을 역산해 결정한다."""
+    from src.scoring import (threshold_for_far, far_for_threshold,
+                             cost_optimal_threshold)
+    st.caption("‘몇 %에서 자르지?’가 아니라 **‘현장이 감당할 오경보/비용은 얼마인가?’** 에서 "
+               "임계값을 역산합니다. 현재 임계값과 비교해 운영 정책을 정하세요.")
+
+    # 정상 오차 분포 확보 (학습 시 저장된 baseline 우선, 없으면 업로드)
+    normal_errors = det.baseline_errors
+    src_txt = "학습 시 저장된 정상 오차 분포"
+    up = st.file_uploader("정상 데이터 CSV (선택 — 올리면 이 데이터 기준으로 계산)",
+                          type=["csv"], key="pol_normal")
+    if up is not None:
+        try:
+            ndf = pd.read_csv(up)
+            ok, miss = _compat(active, ndf.columns)
+            if not ok:
+                st.error(f"스키마 불일치 — 누락: {', '.join(miss[:6])}")
+                return
+            if label_col and label_col in ndf.columns:
+                ndf = ndf[ndf[label_col] == 0]
+            normal_errors = det.predict(ndf).errors
+            src_txt = f"업로드 정상 데이터({up.name}, {len(ndf):,}행)"
+        except Exception as e:  # noqa: BLE001
+            st.error(f"처리 실패: {e}")
+            return
+    if normal_errors is None or len(normal_errors) == 0:
+        st.warning("정상 오차 분포가 없습니다. 정상 데이터 CSV를 올리거나 모델을 새로 학습하세요.")
+        return
+    st.caption(f"기준 분포: {src_txt} ({len(normal_errors):,}건) · "
+               f"현재 임계값 {det.threshold:.5f} "
+               f"(이때 오경보율 {far_for_threshold(normal_errors, det.threshold) * 100:.2f}%)")
+
+    st.markdown("#### ① 오경보 허용량에서 역산")
+    c = st.columns(3)
+    per = c[0].selectbox("기간", ["하루", "일주일", "한 달"], key="pol_period")
+    allowed = c[1].number_input("허용 오경보 건수", 1, 10000, 10, key="pol_allowed")
+    interval = c[2].number_input("샘플 간격(분)", 0.1, 1440.0, 1.0, step=0.5, key="pol_interval")
+    minutes = {"하루": 1440, "일주일": 10080, "한 달": 43200}[per]
+    n_samples = max(minutes / float(interval), 1)
+    target_far = min(float(allowed) / n_samples, 0.5)
+    thr_far = threshold_for_far(normal_errors, target_far)
+    m = st.columns(3)
+    m[0].metric(f"{per} 예상 샘플 수", f"{n_samples:,.0f}건")
+    m[1].metric("필요 오경보율", f"{target_far * 100:.3f}%")
+    m[2].metric("권장 임계값", f"{thr_far:.5f}",
+                f"{thr_far - det.threshold:+.5f} vs 현재", delta_color="off")
+    _note(f"{per}에 오경보를 {allowed}건 이하로 유지하려면 임계값을 <b>{thr_far:.5f}</b> 이상으로 "
+          "두어야 합니다.<br>임계값을 올리면 오경보는 줄지만 미탐이 늘 수 있으니 아래 비용 관점과 "
+          "함께 판단하세요.")
+
+    st.markdown("#### ② 미탐·오탐 비용에서 최적화")
+    if not (label_col and label_col in st.session_state.get("data_df", pd.DataFrame()).columns):
+        st.info("라벨이 포함된 데이터를 'EDA' 메뉴에서 준비하면 비용 기반 최적 임계값을 계산합니다.")
+        return
+    ddf = st.session_state["data_df"]
+    ok, miss = _compat(active, ddf.columns)
+    if not ok:
+        st.info(f"준비된 데이터가 이 모델과 호환되지 않습니다(누락: {', '.join(miss[:4])}).")
+        return
+    cc = st.columns(2)
+    c_fn = cc[0].number_input("미탐(FN) 1건 비용", 1.0, 10000.0, 50.0, step=10.0, key="pol_cfn",
+                              help="이상을 놓쳤을 때 손실(설비 손상·다운타임)")
+    c_fp = cc[1].number_input("오탐(FP) 1건 비용", 1.0, 10000.0, 1.0, step=1.0, key="pol_cfp",
+                              help="헛알람 1건당 점검 공수")
+    res = det.predict(ddf)
+    opt = cost_optimal_threshold(ddf[label_col].values, res.errors, c_fn, c_fp)
+    if not opt:
+        st.info("정상·이상이 모두 있어야 비용 최적화를 계산할 수 있습니다.")
+        return
+    cur_pred = (res.errors >= det.threshold).astype(int)
+    y = ddf[label_col].values.astype(int)
+    cur_cost = int(((y == 1) & (cur_pred == 0)).sum()) * c_fn + \
+        int(((y == 0) & (cur_pred == 1)).sum()) * c_fp
+    o = st.columns(3)
+    o[0].metric("비용 최소 임계값", f"{opt['threshold']:.5f}")
+    o[1].metric("그때 총비용", f"{opt['total_cost']:,.0f}", f"미탐 {opt['fn']} · 오탐 {opt['fp']}",
+                delta_color="off")
+    o[2].metric("현재 임계값 총비용", f"{cur_cost:,.0f}",
+                f"{opt['total_cost'] - cur_cost:+,.0f} 차이", delta_color="off")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=opt["curve_thresholds"], y=opt["curve_costs"],
+                             mode="lines", name="총비용", line=dict(color=NORMAL_C)))
+    fig.add_vline(x=opt["threshold"], line_dash="dash", line_color="#238b45",
+                  annotation_text="비용 최소")
+    fig.add_vline(x=det.threshold, line_dash="dot", line_color=ANOM_C, annotation_text="현재")
+    fig.add_vline(x=thr_far, line_dash="dot", line_color="#e6550d", annotation_text="FAR 목표")
+    fig.update_layout(height=330, xaxis_title="임계값", yaxis_title="총비용",
+                      legend=dict(orientation="h"))
+    st.plotly_chart(fig, use_container_width=True)
+    _note("미탐 비용이 오탐보다 크면 임계값을 낮춰(민감하게) 놓치지 않는 쪽이 유리합니다.<br>"
+          "세 기준(현재·FAR 목표·비용 최소)을 비교해 운영 정책을 합의하세요. "
+          "최종 임계값은 '모델 생성' 시 백분위수로 반영하거나 판정 화면 슬라이더로 적용합니다.")
+
+
 # ----------------------------- 단건 수동 판정 -----------------------------
 
 def render_manual(detector):
@@ -1068,7 +1165,7 @@ def page_eval(cfg, models_dir, label_col):
     st.header("📊 3. 모델 평가")
     mode = st.radio("평가 방식",
                     ["🕐 시간분할 검증 (권장)", "⌨️ 단일 샘플 판정",
-                     "📄 테스트셋 파일 평가", "📊 모델 비교"],
+                     "📄 테스트셋 파일 평가", "📊 모델 비교", "🎚 임계값 정책"],
                     horizontal=True, key="eval_mode")
     st.divider()
 
@@ -1096,7 +1193,9 @@ def page_eval(cfg, models_dir, label_col):
     kind = "LSTM-AE(시계열)" if det.model_type == "lstm" else "Dense AE(행 단위)"
     st.success(f"평가 대상 모델: **{name}** · {kind} · 피처 {len(det.schema.feature_columns)}개")
 
-    if mode.startswith("⌨️"):
+    if mode.startswith("🎚"):
+        render_threshold_policy(det, active, label_col)
+    elif mode.startswith("⌨️"):
         render_manual(det)
     elif mode.startswith("📄"):
         up = st.file_uploader("테스트셋 CSV 업로드", type=["csv"], key="eval_upload")
