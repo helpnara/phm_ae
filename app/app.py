@@ -625,6 +625,115 @@ def render_comparison(models_dir, df, label_col):
     _render_comparison_result()
 
 
+# ----------------------------- 평가 프로토콜(에피소드·지연) -----------------------------
+
+def render_protocol_metrics(df, y_true, y_pred, ts_col):
+    """에피소드 검출률·탐지 지연·유형별 검출률을 표시한다(현장 관점 지표)."""
+    from src import protocol as PROTO
+    ts = df[ts_col] if (ts_col and ts_col in df.columns) else None
+    em = PROTO.episode_metrics(y_true, y_pred, ts)
+    if em["n_episodes"] == 0:
+        st.info("이상 구간(에피소드)이 없어 에피소드 지표를 계산할 수 없습니다.")
+        return
+
+    st.subheader("🎯 현장 관점 지표 (에피소드 · 탐지 지연)")
+    c = st.columns(4)
+    c[0].metric("이상 에피소드", f"{em['n_episodes']}건")
+    c[1].metric("에피소드 검출률", f"{em['episode_recall'] * 100:.0f}%",
+                f"{em['n_detected']}/{em['n_episodes']} 검출")
+    med = em["median_latency"]
+    c[2].metric("탐지 지연(중앙값)", f"{med:.0f} 샘플" if med is not None else "-",
+                help="에피소드 시작부터 첫 검출까지 걸린 샘플 수")
+    c[3].metric("정상 오경보율", f"{em['false_alarm_rate'] * 100:.2f}%",
+                f"{em['n_false_alarms']}건", delta_color="off")
+    _note("샘플 F1보다 <b>에피소드 검출률</b>과 <b>탐지 지연</b>이 현장 유용성에 가깝습니다.<br>"
+          "이상 구간을 놓치지 않고(검출률↑) 빨리 잡되(지연↓), 정상 오경보는 낮아야 합니다.<br>"
+          "지연이 길면 조기 경보 가치가 떨어지고, 오경보율이 높으면 현장이 알람을 무시하게 됩니다.")
+    with st.expander(f"에피소드별 상세 ({em['n_episodes']}건)"):
+        st.dataframe(em["frame"], use_container_width=True, hide_index=True)
+
+    if "fault_type" in df.columns:
+        pt = PROTO.per_type_recall(y_true, y_pred, df["fault_type"])
+        if not pt.empty:
+            st.subheader("이상 유형별 검출률")
+            fig = px.bar(pt, x="검출률(%)", y="이상 유형", orientation="h",
+                         color_discrete_sequence=[NORMAL_C], text="검출률(%)")
+            fig.update_layout(height=260, yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(pt, use_container_width=True, hide_index=True)
+            _note("검출률이 낮은 유형이 이 모델의 약점입니다. "
+                  "해당 유형이 중요하다면 관련 센서 추가·병목 축소·임계값 하향을 검토하세요.")
+
+
+def render_time_split_validation(df, cfg, models_dir, label_col, ts_col):
+    """과거로 학습 → 미래로 평가(운영과 동일한 순서)하는 정직한 검증."""
+    from src import protocol as PROTO
+    from src.evaluate import compute_metrics
+    st.caption("과거 구간의 **정상 데이터만** 학습하고, 이후 미래 구간으로 평가합니다. "
+               "무작위 분할보다 보수적이며 실제 운영 성능에 가깝습니다.")
+    if not (label_col and label_col in df.columns):
+        st.warning("라벨(label) 컬럼이 있어야 검증 지표를 계산할 수 있습니다.")
+        return
+
+    c = st.columns(3)
+    test_frac = c[0].slider("평가 구간 비율(미래)", 0.1, 0.6, 0.3, 0.05, key="ts_frac")
+    epochs = c[1].number_input("epoch", 10, 300, int(cfg["train"]["epochs"]), step=10, key="ts_ep")
+    pct = c[2].number_input("임계값 백분위수(%)", 90.0, 99.9,
+                            float(cfg["threshold"].get("percentile", 99.0)), 0.5, key="ts_pct")
+
+    if st.button("🕐 시간분할 검증 실행", type="primary"):
+        try:
+            train_df, test_df = PROTO.time_based_split(df, ts_col, test_frac)
+        except ValueError as e:
+            st.error(str(e))
+            return
+        train_norm = train_df[train_df[label_col] == 0]
+        if len(train_norm) < 50:
+            st.error(f"과거 구간의 정상 데이터가 부족합니다({len(train_norm)}건).")
+            return
+        st.caption(f"학습(과거) 정상 {len(train_norm):,}건 → 평가(미래) {len(test_df):,}건 "
+                   f"(이상 {int(test_df[label_col].sum()):,}건)")
+
+        import copy as _copy
+        from src.train import train_from_dataframe
+        c2 = _copy.deepcopy(cfg)
+        c2["train"]["epochs"] = int(epochs)
+        c2["threshold"]["percentile"] = float(pct)
+        tmpdir = REG.new_entry_dir(models_dir, "dense", "시간분할검증")
+        with st.spinner("과거 구간으로 학습 중..."):
+            try:
+                train_from_dataframe(train_norm, c2, artifacts_dir=tmpdir, verbose=0,
+                                     data_source="time-split validation")
+            except Exception as e:  # noqa: BLE001
+                REG.delete_model(tmpdir)
+                st.error(f"학습 실패: {e}")
+                return
+        REG.write_entry_info(tmpdir, {"name": "시간분할검증", "tags": ["검증"]})
+        det = AnomalyDetector(tmpdir)
+        res = det.predict(test_df)
+        y = test_df[label_col].values
+        m = compute_metrics(y, res.errors, res.predictions)
+        st.session_state["tsplit"] = {
+            "metrics": m, "path": tmpdir,
+            "test": test_df.to_json(orient="split"), "pred": res.predictions.tolist(),
+        }
+
+    r = st.session_state.get("tsplit")
+    if not r:
+        return
+    m = r["metrics"]
+    st.success(f"검증 완료 — 모델은 **'시간분할검증'** 으로 저장되었습니다.")
+    mm = st.columns(4)
+    mm[0].metric("Precision", f"{m['precision']:.3f}")
+    mm[1].metric("Recall", f"{m['recall']:.3f}")
+    mm[2].metric("F1", f"{m['f1']:.3f}")
+    mm[3].metric("PR-AUC", f"{m['pr_auc']:.3f}" if m["pr_auc"] is not None else "N/A")
+    _note("이 수치는 <b>미래 구간</b>에서 측정한 것으로, 같은 데이터로 임계값을 정하고 평가한 "
+          "값보다 보수적입니다. 보고·의사결정에는 이 수치를 사용하세요.")
+    tdf = pd.read_json(io.StringIO(r["test"]), orient="split")
+    render_protocol_metrics(tdf, tdf[label_col].values, np.array(r["pred"]), ts_col)
+
+
 # ----------------------------- 단건 수동 판정 -----------------------------
 
 def render_manual(detector):
@@ -957,6 +1066,24 @@ def page_train(cfg, models_dir, label_col, ts_col, exclude):
 
 def page_eval(cfg, models_dir, label_col):
     st.header("📊 3. 모델 평가")
+    mode = st.radio("평가 방식",
+                    ["🕐 시간분할 검증 (권장)", "⌨️ 단일 샘플 판정",
+                     "📄 테스트셋 파일 평가", "📊 모델 비교"],
+                    horizontal=True, key="eval_mode")
+    st.divider()
+
+    # 시간분할 검증은 자체적으로 학습하므로 활성 모델이 필요 없다
+    if mode.startswith("🕐"):
+        ts_col = cfg["data"].get("timestamp_column")
+        data_df = st.session_state.get("data_df")
+        if data_df is None:
+            st.info("먼저 'EDA' 메뉴에서 데이터를 준비하세요(업로드 또는 샘플 생성). "
+                    "라벨(label)이 포함된 데이터가 필요합니다.")
+            return
+        st.caption(f"대상 데이터: **{st.session_state.get('data_name', '?')}** · {len(data_df):,}행")
+        render_time_split_validation(data_df, cfg, models_dir, label_col, ts_col)
+        return
+
     render_model_registry(models_dir)   # 평가할 모델 선택·관리(우측)
     st.divider()
     active = st.session_state.get("active_model_dir")
@@ -968,10 +1095,6 @@ def page_eval(cfg, models_dir, label_col):
     name = REG.read_entry_info(active).get("name", os.path.basename(active))
     kind = "LSTM-AE(시계열)" if det.model_type == "lstm" else "Dense AE(행 단위)"
     st.success(f"평가 대상 모델: **{name}** · {kind} · 피처 {len(det.schema.feature_columns)}개")
-
-    mode = st.radio("평가 방식", ["⌨️ 단일 샘플 판정", "📄 테스트셋 파일 평가", "📊 모델 비교"],
-                    horizontal=True, key="eval_mode")
-    st.divider()
 
     if mode.startswith("⌨️"):
         render_manual(det)
@@ -994,6 +1117,11 @@ def page_eval(cfg, models_dir, label_col):
             render_training_quality(det, tdf, label_col)
             st.divider()
             render_results(det, tdf, label_col)
+            if label_col and label_col in tdf.columns:
+                st.divider()
+                _res = det.predict(tdf)
+                render_protocol_metrics(tdf, tdf[label_col].values, _res.predictions,
+                                        det.schema.timestamp_column)
         except ValueError as e:
             st.error(f"평가 실패: {e}")
     else:

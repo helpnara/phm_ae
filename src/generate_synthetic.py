@@ -94,7 +94,8 @@ def build_scenario_df(n: int, anomaly_ratio: float, seed: int,
         X[:, 0] += NORMAL_STD[0] * ramp          # temperature 서서히 상승
         X[:, 1] += NORMAL_STD[1] * ramp * 0.8    # vibration 동반 상승
 
-    # ---- 이상 주입: 난이도에 따른 크기 ----
+    # ---- 이상 주입: 난이도에 따른 크기 · 유형 라벨 기록 ----
+    ftype = np.array([""] * n, dtype=object)
     n_anom = int(n * anomaly_ratio)
     if n_anom > 0:
         idx = rng.choice(n, n_anom, replace=False)
@@ -103,12 +104,15 @@ def build_scenario_df(n: int, anomaly_ratio: float, seed: int,
             if i % 3 == 0:      # 단일 센서 스파이크
                 j = int(rng.integers(0, len(SENSORS)))
                 X[r, j] += rng.choice([-1, 1]) * NORMAL_STD[j] * mag
+                ftype[r] = "스파이크"
             elif i % 3 == 1:    # 온도·진동 동반 상승(과열)
                 X[r, 0] += NORMAL_STD[0] * mag
                 X[r, 1] += NORMAL_STD[1] * mag * 0.9
+                ftype[r] = "과열(온도·진동)"
             else:               # 상관 구조 붕괴(rpm↑ current↓)
                 X[r, 3] += NORMAL_STD[3] * mag * 0.8
                 X[r, 4] -= NORMAL_STD[4] * mag * 0.8
+                ftype[r] = "상관구조 붕괴"
             y[r] = 1
 
     ts = pd.date_range("2026-04-01", periods=n, freq="min")
@@ -117,6 +121,7 @@ def build_scenario_df(n: int, anomaly_ratio: float, seed: int,
     if n_modes > 1:
         df["mode"] = mode_id
     df["label"] = y
+    df["fault_type"] = ftype
 
     # ---- 결측 주입 ----
     if missing_rate > 0:
