@@ -638,13 +638,45 @@ def render_manual(detector):
     feats = detector.schema.feature_columns
     means = getattr(detector.scaler, "mean_", None)
     scales = getattr(detector.scaler, "scale_", None)
+    defaults = {f: (float(means[i]) if means is not None else 0.0) for i, f in enumerate(feats)}
+
+    mode = st.radio("입력 방식", ["1건 입력", "여러 건 입력(표)"], horizontal=True, key="manual_mode")
+
+    if mode.startswith("여러"):
+        n_rows = st.number_input("행 수", 1, 50, 3, key="manual_rows")
+        base = pd.DataFrame([defaults] * int(n_rows))
+        edited = st.data_editor(base, use_container_width=True, num_rows="dynamic",
+                                key="manual_editor")
+        if st.button("🔎 일괄 판정", type="primary"):
+            try:
+                rows = edited.dropna(how="all")
+                for f in feats:
+                    rows[f] = pd.to_numeric(rows[f], errors="coerce").fillna(defaults[f])
+                res = detector.predict(rows[feats])
+            except ValueError as e:
+                st.error(f"판정 실패: {e}")
+                return
+            thr = float(detector.threshold)
+            out = rows[feats].copy().reset_index(drop=True)
+            out["재구성오차"] = res.errors.round(6)
+            out["이상점수"] = (res.errors / thr).round(2)
+            out["판정"] = np.where(res.predictions == 1, "이상 ⚠️", "정상 ✅")
+            top_idx = res.per_feature_error.argmax(axis=1)
+            out["주요기여"] = [feats[i] for i in top_idx]
+            st.dataframe(out, use_container_width=True, hide_index=True)
+            st.metric("이상 건수", f"{int(res.predictions.sum())} / {len(out)}")
+            st.download_button("판정 결과 CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                               "manual_batch_result.csv", "text/csv")
+            _note("표에서 값을 수정해 여러 조건을 한 번에 비교할 수 있습니다. "
+                  "‘주요기여’는 해당 행에서 오차가 가장 큰 센서입니다.")
+        return
+
     ncol = min(len(feats), 4)
     cols = st.columns(ncol)
     vals = {}
     for i, f in enumerate(feats):
-        default = float(means[i]) if means is not None else 0.0
         step = float(scales[i] / 10) if scales is not None else 0.1
-        vals[f] = cols[i % ncol].number_input(f, value=round(default, 4),
+        vals[f] = cols[i % ncol].number_input(f, value=round(defaults[f], 4),
                                                step=round(step, 4), format="%.4f",
                                                key=f"manual_{f}")
 
@@ -994,6 +1026,24 @@ def page_monitor(cfg, models_dir, label_col):
 
     ts_col = det.schema.timestamp_column
     has_ts = bool(ts_col) and ts_col in mdf.columns
+
+    # 기간(날짜) 필터 — 타임스탬프가 있을 때 특정 구간만 분석
+    if has_ts:
+        _t = pd.to_datetime(mdf[ts_col], errors="coerce")
+        if _t.notna().sum() > 1 and _t.min() != _t.max():
+            dmin, dmax = _t.min().date(), _t.max().date()
+            with st.expander(f"📅 기간 필터 (전체 {dmin} ~ {dmax})"):
+                rng = st.date_input("분석 기간", value=(dmin, dmax),
+                                    min_value=dmin, max_value=dmax, key="mon_period")
+                if isinstance(rng, (tuple, list)) and len(rng) == 2:
+                    s, e = pd.Timestamp(rng[0]), pd.Timestamp(rng[1]) + pd.Timedelta(days=1)
+                    sel = (_t >= s) & (_t < e)
+                    if sel.sum() == 0:
+                        st.warning("선택 기간에 데이터가 없습니다. 전체 기간으로 분석합니다.")
+                    elif sel.sum() < len(mdf):
+                        mdf = mdf[sel].reset_index(drop=True)
+                        st.caption(f"기간 필터 적용: {rng[0]} ~ {rng[1]} · {len(mdf):,}행")
+
     freq_map = {"자동 구간": None, "시간(H)": "h", "일(D)": "d", "주(W)": "w"}
     method_map = {"z-score (평균 이동)": "zscore", "PSI (분포 안정성)": "psi",
                   "KS 검정 (분포 동일성)": "ks"}
@@ -1095,12 +1145,16 @@ def page_monitor(cfg, models_dir, label_col):
     bar.update_layout(height=300, xaxis_title="구간", yaxis_title="이상률(%)")
     st.plotly_chart(bar, use_container_width=True)
 
-    # 구간 표 & 다운로드
-    with st.expander("구간별 상세 표"):
+    # 구간 표 & 다운로드 (드리프트 표시 열 포함)
+    n_drift = int(drift_mask.sum())
+    with st.expander(f"구간별 상세 표 (드리프트 {n_drift}/{len(wm)} 구간)", expanded=n_drift > 0):
         show = wm.copy()
         show["anomaly_rate(%)"] = (show["anomaly_rate"] * 100).round(1)
+        show["드리프트"] = np.where(drift_mask.values, "⚠️ 초과", "정상")
+        show["기준대비"] = (show["mean_error"] / max(ds["base_mean"], 1e-12)).round(2)
         show = show.drop(columns=["anomaly_rate"])
         st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("‘드리프트’=구간 평균오차가 드리프트 임계 초과 · ‘기준대비’=학습 평균 대비 배수.")
         st.download_button("구간 요약 CSV", show.to_csv(index=False).encode("utf-8-sig"),
                            "monitoring_windows.csv", "text/csv")
 
@@ -1116,13 +1170,37 @@ def main():
     os.makedirs(models_dir, exist_ok=True)
     REG.prune_incomplete(models_dir)
 
+    # 진행 상태(온보딩·메뉴 표시용)
+    n_models = len(REG.list_models(models_dir))
+    data_ready = st.session_state.get("data_df") is not None
+    data_name = st.session_state.get("data_name", "")
+
     # ---- 좌측: 메뉴 내비게이터(만) ----
     with st.sidebar:
         st.header("메뉴")
         page = st.radio("메뉴", [MENU_EDA, MENU_TRAIN, MENU_EVAL, MENU_MON],
                         label_visibility="collapsed", key="menu")
-        st.caption("메뉴를 선택하면 우측에 해당 화면이 표시됩니다.\n\n"
-                   "EDA → 모델 생성 → 모델 평가 순으로 진행하세요.")
+        st.divider()
+        st.markdown("**진행 상태**")
+        st.markdown(
+            (f"- 데이터: {'✅ ' + (data_name[:18] if data_name else '준비됨')}" if data_ready
+             else "- 데이터: ⬜ 미준비 (1.EDA)") + "\n"
+            + (f"- 모델: ✅ {n_models}개 저장" if n_models else "- 모델: ⬜ 없음 (2.모델 생성)"))
+        st.caption("EDA → 모델 생성 → 모델 평가 → 모니터링 순으로 진행하세요.")
+
+    # 첫 방문 온보딩 안내(데이터·모델 모두 없을 때만)
+    if not data_ready and n_models == 0 and not st.session_state.get("onboard_hide"):
+        with st.container(border=True):
+            oc1, oc2 = st.columns([5, 1])
+            oc1.markdown(
+                "**👋 처음이신가요? 이렇게 진행하세요**  \n"
+                "**1️⃣ EDA** — CSV를 올리거나 ‘샘플 생성’으로 데이터를 준비하고 분석 → "
+                "**2️⃣ 모델 생성** — 정상 데이터로 학습 → "
+                "**3️⃣ 모델 평가** — 단일 샘플·테스트셋·모델 비교 → "
+                "**4️⃣ 모니터링** — 운영 데이터 드리프트 점검")
+            if oc2.button("닫기", use_container_width=True):
+                st.session_state["onboard_hide"] = True
+                st.rerun()
 
     # ---- 라우팅 ----
     if page == MENU_EDA:
