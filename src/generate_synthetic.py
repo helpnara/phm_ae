@@ -54,6 +54,78 @@ def build_tabular_df(n: int, anomaly_ratio: float, seed: int) -> pd.DataFrame:
     return df
 
 
+#: 난이도별 이상 크기(정상 σ 배수). 값이 작을수록 정상과 겹쳐 탐지가 어렵다.
+DIFFICULTY = {
+    "미세 (어려움)": (1.5, 3.0),
+    "보통": (3.0, 6.0),
+    "뚜렷 (쉬움)": (6.0, 10.0),
+}
+
+
+def build_scenario_df(n: int, anomaly_ratio: float, seed: int,
+                      difficulty: str = "보통", n_modes: int = 1,
+                      degradation: bool = False, missing_rate: float = 0.0) -> pd.DataFrame:
+    """현실적인 PoC용 데이터를 생성한다(난이도·운전모드·열화·결측 조절).
+
+    - difficulty: 이상 크기(σ 배수) — '미세'일수록 정상 분포와 겹쳐 탐지가 어렵다.
+    - n_modes: 정상 운전 모드 수(가동/부하 조건 등). 2 이상이면 정상이 다봉 분포가 된다.
+    - degradation: 후반부에 점진적 열화(서서히 증가하는 오프셋)를 주입한다.
+    - missing_rate: 무작위 결측 비율(센서 결측 상황 재현).
+    """
+    rng = np.random.default_rng(seed)
+    lo, hi = DIFFICULTY.get(difficulty, DIFFICULTY["보통"])
+    n_modes = max(int(n_modes), 1)
+
+    # ---- 정상: 운전 모드별로 평균이 다른 다봉 분포 ----
+    mode_id = rng.integers(0, n_modes, n)
+    # 모드별 오프셋(σ의 ±0~4배 범위에서 결정적으로 배치)
+    mode_offsets = np.linspace(-2.0, 2.0, n_modes) if n_modes > 1 else np.array([0.0])
+    base = rng.standard_normal((n, 1))
+    noise = rng.standard_normal((n, len(SENSORS)))
+    corr = 0.5 * base + 0.5 * noise
+    X = NORMAL_MEAN + NORMAL_STD * (corr + mode_offsets[mode_id][:, None])
+    y = np.zeros(n, dtype=int)
+
+    # ---- 점진적 열화: 후반 40% 구간에서 서서히 증가하는 오프셋 ----
+    if degradation:
+        start = int(n * 0.6)
+        ramp = np.zeros(n)
+        ramp[start:] = np.linspace(0, hi * 0.7, n - start)
+        X[:, 0] += NORMAL_STD[0] * ramp          # temperature 서서히 상승
+        X[:, 1] += NORMAL_STD[1] * ramp * 0.8    # vibration 동반 상승
+
+    # ---- 이상 주입: 난이도에 따른 크기 ----
+    n_anom = int(n * anomaly_ratio)
+    if n_anom > 0:
+        idx = rng.choice(n, n_anom, replace=False)
+        for i, r in enumerate(idx):
+            mag = rng.uniform(lo, hi)
+            if i % 3 == 0:      # 단일 센서 스파이크
+                j = int(rng.integers(0, len(SENSORS)))
+                X[r, j] += rng.choice([-1, 1]) * NORMAL_STD[j] * mag
+            elif i % 3 == 1:    # 온도·진동 동반 상승(과열)
+                X[r, 0] += NORMAL_STD[0] * mag
+                X[r, 1] += NORMAL_STD[1] * mag * 0.9
+            else:               # 상관 구조 붕괴(rpm↑ current↓)
+                X[r, 3] += NORMAL_STD[3] * mag * 0.8
+                X[r, 4] -= NORMAL_STD[4] * mag * 0.8
+            y[r] = 1
+
+    ts = pd.date_range("2026-04-01", periods=n, freq="min")
+    df = pd.DataFrame(X, columns=SENSORS)
+    df.insert(0, "timestamp", ts)
+    if n_modes > 1:
+        df["mode"] = mode_id
+    df["label"] = y
+
+    # ---- 결측 주입 ----
+    if missing_rate > 0:
+        for c in SENSORS:
+            m = rng.random(n) < missing_rate
+            df.loc[m, c] = np.nan
+    return df
+
+
 def build_timeseries_df(n: int, anomaly_ratio: float, seed: int) -> pd.DataFrame:
     """시계열(AR(1) 자기상관 강함) 라벨 데이터프레임을 생성한다(LSTM 데모용)."""
     rng = np.random.default_rng(seed)

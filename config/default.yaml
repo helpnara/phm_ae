@@ -35,6 +35,9 @@ threshold:
   method: "percentile"
   percentile: 99.0
   k_std: 3.0
+  # 임계값 보정용으로 떼어둘 정상 데이터 비율(학습에 사용하지 않음).
+  # 0으로 두면 학습 데이터에서 임계값을 산출(낙관적 편향 → 오경보 증가) — 권장하지 않음.
+  calibration_split: 0.2
 
 paths:
   artifacts_dir: "artifacts"

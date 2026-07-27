@@ -66,6 +66,23 @@ def baseline_from_errors(errors: np.ndarray) -> Dict[str, float]:
             "std": float(e.std()) if len(e) else 0.0}
 
 
+def alarm_events(predictions: np.ndarray, k: int = 3, m: int = 5) -> Dict[str, Any]:
+    """알람 디바운싱: 최근 M건 중 K건 이상이 이상일 때만 '알람'으로 인정한다.
+
+    1건만으로 알람하면 오경보가 폭증하므로 현장에서는 연속/누적 규칙을 쓴다.
+    반환: {flags(알람 상태 배열), n_alarm_points, n_events(알람 발생 횟수), start_idx(발생 지점)}
+    """
+    p = pd.Series(np.asarray(predictions, dtype=int))
+    m = max(int(m), 1)
+    k = max(min(int(k), m), 1)
+    hit = p.rolling(m, min_periods=m).sum() >= k
+    flags = hit.fillna(False).to_numpy()
+    # 상승 에지 = 알람 발생 시점
+    starts = np.where(flags & ~np.concatenate([[False], flags[:-1]]))[0]
+    return {"flags": flags, "n_alarm_points": int(flags.sum()),
+            "n_events": int(len(starts)), "start_idx": starts.tolist()}
+
+
 def psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
     """Population Stability Index. expected=baseline, actual=현재. 클수록 분포 이동 큼."""
     e = np.asarray(expected, dtype=float)

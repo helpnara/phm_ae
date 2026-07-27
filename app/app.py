@@ -831,15 +831,34 @@ def page_eda(cfg, ts_col, exclude):
                                              mime="text/csv", use_container_width=True,
                                              help=capd)
     with tab_gen:
+        from src.generate_synthetic import build_scenario_df, DIFFICULTY
         g = st.columns(4)
-        kind = g[0].selectbox("유형", ["행 단위", "시계열(자기상관)"], key="gen_kind")
-        n = g[1].number_input("행 수", 100, 20000, 600, step=100, key="gen_n")
+        kind = g[0].selectbox("유형", ["현실 시나리오", "행 단위(단순)", "시계열(자기상관)"],
+                              key="gen_kind")
+        n = g[1].number_input("행 수", 100, 20000, 1200, step=100, key="gen_n")
         ratio = g[2].number_input("이상 비율", 0.0, 0.5, 0.1, step=0.05, key="gen_ratio")
         seed = g[3].number_input("seed", 0, 9999, 42, key="gen_seed")
+        if kind == "현실 시나리오":
+            s = st.columns(4)
+            diff = s[0].selectbox("이상 난이도", list(DIFFICULTY.keys()), index=1, key="gen_diff")
+            modes = s[1].number_input("운전 모드 수", 1, 5, 1, key="gen_modes")
+            degr = s[2].checkbox("점진적 열화", key="gen_degr")
+            miss = s[3].number_input("결측 비율", 0.0, 0.2, 0.0, step=0.01, key="gen_miss")
+            st.caption("난이도가 '미세'일수록 정상과 겹쳐 탐지가 어렵습니다(실데이터에 가까움). "
+                       "운전 모드 2↑는 정상이 다봉 분포가 되고, 열화는 후반부에 서서히 이상이 진행됩니다.")
         if st.button("🧪 샘플 생성", type="primary"):
-            gdf = (build_timeseries_df(int(n), float(ratio), int(seed))
-                   if kind.startswith("시계열") else build_tabular_df(int(n), float(ratio), int(seed)))
-            _set_data(gdf, f"합성-{kind}({int(n)}행)")
+            if kind == "현실 시나리오":
+                gdf = build_scenario_df(int(n), float(ratio), int(seed), difficulty=diff,
+                                        n_modes=int(modes), degradation=bool(degr),
+                                        missing_rate=float(miss))
+                tag = f"{diff}·모드{int(modes)}{'·열화' if degr else ''}"
+            elif kind.startswith("시계열"):
+                gdf = build_timeseries_df(int(n), float(ratio), int(seed))
+                tag = "시계열"
+            else:
+                gdf = build_tabular_df(int(n), float(ratio), int(seed))
+                tag = "행 단위"
+            _set_data(gdf, f"합성-{tag}({int(n)}행)")
             st.success("샘플이 생성되었습니다.")
 
     df = st.session_state.get("data_df")
@@ -1137,6 +1156,23 @@ def page_monitor(cfg, models_dir, label_col):
     st.plotly_chart(fig, use_container_width=True)
     _note("구간 평균 오차가 학습 평균 위로 지속 상승하면 드리프트 신호입니다. "
           "드리프트 임계를 넘는 구간은 X로 표시됩니다. → 재학습/점검 판단에 활용.")
+
+    # 알람 정책(디바운싱) — 1건 이상만으로 알람하면 오경보 폭증
+    st.subheader("🔔 알람 정책 (디바운싱)")
+    ac = st.columns([1, 1, 2])
+    m_win = ac[0].number_input("판정 창 M건", 1, 100, 5, key="alarm_m")
+    k_hit = ac[1].number_input("그중 이상 K건 이상", 1, 100, 3, key="alarm_k")
+    al = MON.alarm_events(res.predictions, k=int(k_hit), m=int(m_win))
+    raw = int(res.predictions.sum())
+    ac[2].metric("알람 발생", f"{al['n_events']}회",
+                 f"원시 이상 {raw}건 → {al['n_events']}회 알람",
+                 delta_color="off")
+    reduce_pct = (1 - al["n_events"] / raw) * 100 if raw else 0.0
+    st.caption(f"규칙: 최근 {int(m_win)}건 중 {int(k_hit)}건 이상 → 알람. "
+               f"단건 알람 대비 발생 건수 **{reduce_pct:.0f}% 감소**.")
+    _note("이상 1건마다 알람하면 산발적 오경보로 현장 신뢰를 잃습니다.<br>"
+          "K/M 규칙은 일시적 튐은 걸러내고 지속되는 이상만 알립니다. "
+          "M을 키우면 안정적이지만 탐지가 느려지고, K를 낮추면 민감해집니다.")
 
     # 구간별 이상 탐지율
     st.subheader("구간별 이상 탐지율")

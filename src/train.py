@@ -54,15 +54,34 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
     if verbose:
         print(f"[train] 샘플 {X.shape[0]}개, 피처 {n_features}개, model={model_type}")
 
-    # 2~4) 모델 구성/학습/임계값 — dense vs lstm
+    # 2) 학습용 / 보정용(calibration) 분리 — 임계값 누수 방지
+    #    임계값을 학습에 쓴 데이터에서 산출하면 오차가 낙관적으로 작아져 임계값이 과소 설정되고,
+    #    운영에서 처음 보는 정상 데이터에 오경보가 급증한다. 따라서 학습에 쓰지 않은
+    #    '보정용 정상 데이터'(시간상 뒤쪽)에서 임계값을 산출한다.
+    calib_frac = float(cfg.get("threshold", {}).get("calibration_split", 0.2))
+    n_rows = X.shape[0]
+    n_cal = int(n_rows * calib_frac) if calib_frac > 0 else 0
+    min_cal = (int(window or 20) + 20) if model_type == "lstm" else 20
+    calibrated = n_cal >= min_cal and (n_rows - n_cal) >= min_cal
+
     if model_type == "lstm":
         window = int(window or 20)
-        Xw = make_windows(X, window)                     # (nw, W, F)
+        if calibrated:
+            # 시퀀스가 섞이지 않도록 행을 먼저 나눈 뒤 각각 윈도우 생성
+            fit_x = make_windows(X[:-n_cal], window)
+            cal_x = make_windows(X[-n_cal:], window)
+        else:
+            fit_x = cal_x = make_windows(X, window)
         model = build_lstm_autoencoder(n_features, window, cfg)
-        fit_x = Xw
     else:
+        if calibrated:
+            fit_x, cal_x = X[:-n_cal], X[-n_cal:]
+        else:
+            fit_x = cal_x = X
         model = build_autoencoder(n_features, cfg)
-        fit_x = X
+    if verbose:
+        print(f"[train] 학습 {len(fit_x)} / 보정 {len(cal_x)} "
+              f"({'분리 적용' if calibrated else '데이터 부족 → 분리 없음'})")
 
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=float(t_cfg["learning_rate"])),
@@ -89,16 +108,19 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
         verbose=verbose,
     )
 
-    # 임계값 산출(정상 데이터 재구성 오차 분포)
+    # 임계값 산출 — 학습에 쓰지 않은 보정용 정상 데이터의 오차 분포에서
     if model_type == "lstm":
-        Xw_hat = model.predict(fit_x, verbose=0)
-        errors, _ = seq_window_errors(fit_x, Xw_hat)
+        cal_hat = model.predict(cal_x, verbose=0)
+        errors, _ = seq_window_errors(cal_x, cal_hat)
     else:
-        X_hat = model.predict(X, verbose=0)
-        errors = reconstruction_error(X, X_hat)
+        cal_hat = model.predict(cal_x, verbose=0)
+        errors = reconstruction_error(cal_x, cal_hat)
     threshold = compute_threshold(errors, cfg)
+    threshold["calibrated"] = bool(calibrated)
+    threshold["n_calibration"] = int(len(cal_x))
     if verbose:
-        print(f"[train] 임계값({threshold['method']}) = {threshold['value']:.6f}")
+        print(f"[train] 임계값({threshold['method']}) = {threshold['value']:.6f}"
+              f" ({'보정 데이터 기준' if calibrated else '학습 데이터 기준(분리 없음)'})")
 
     # 5) 아티팩트 저장
     artifacts_dir = artifacts_dir or cfg["paths"]["artifacts_dir"]
@@ -110,6 +132,9 @@ def train_from_dataframe(df, cfg: dict, artifacts_dir: str | None = None,
         "data_source": data_source,
         "model_type": model_type,
         "window": int(window) if model_type == "lstm" else None,
+        "calibrated_threshold": bool(calibrated),
+        "n_train": int(len(fit_x)),
+        "n_calibration": int(len(cal_x)),
         "n_samples": int(X.shape[0]),
         "n_features": int(n_features),
         "seed": seed,
