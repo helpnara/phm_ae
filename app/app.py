@@ -28,8 +28,10 @@ import plotly.graph_objects as go
 import streamlit as st
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+for _p in (ROOT, APP_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from src.config import load_config
 from src.detector import AnomalyDetector
@@ -917,6 +919,7 @@ MENU_EDA = "🔍 1. EDA"
 MENU_TRAIN = "🛠 2. 모델 생성"
 MENU_EVAL = "📊 3. 모델 평가"
 MENU_MON = "📈 4. 성능 모니터링"
+MENU_HELP = "📚 도움말"
 
 
 def _model_label(m: dict) -> str:
@@ -1441,7 +1444,7 @@ def main():
     # ---- 좌측: 메뉴 내비게이터(만) ----
     with st.sidebar:
         st.header("메뉴")
-        page = st.radio("메뉴", [MENU_EDA, MENU_TRAIN, MENU_EVAL, MENU_MON],
+        page = st.radio("메뉴", [MENU_EDA, MENU_TRAIN, MENU_EVAL, MENU_MON, MENU_HELP],
                         label_visibility="collapsed", key="menu")
         st.divider()
         st.markdown("**진행 상태**")
@@ -1472,8 +1475,11 @@ def main():
         page_train(cfg, models_dir, label_col, ts_col, exclude)
     elif page == MENU_EVAL:
         page_eval(cfg, models_dir, label_col)
-    else:
+    elif page == MENU_MON:
         page_monitor(cfg, models_dir, label_col)
+    else:
+        from help_page import render_help
+        render_help()
 
 
 if __name__ == "__main__":
