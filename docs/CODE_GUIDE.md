@@ -6,7 +6,11 @@
 > 이 파일이 **원본**입니다. 앱의 `🧩 코드 가이드` 메뉴는 이 파일을 그대로 읽어 보여줍니다.
 > 코드를 고치면 이 문서도 함께 갱신하세요.
 
-**읽는 순서 추천**: ① 아키텍처 → ② 실행 흐름 → ③ 모듈 레퍼런스(관심 모듈만) → ④ 데이터 계약
+**읽는 순서 추천**
+- **처음 코드를 볼 때**: ① 아키텍처 → ② 실행 흐름 → ④ 데이터 계약
+- **원리가 궁금할 때**: ⑤ 오토인코더 이론과 수식 (수식 ↔ 코드 대응 표시)
+- **화면 코드를 볼 때**: ⑥ Streamlit 동작 방식 (재실행 모델·session_state·캐시)
+- **고칠 때**: ③ 모듈 레퍼런스 → ⑦ 설계 이유 → ⑧ 확장 가이드
 
 ---
 
@@ -392,7 +396,360 @@ render_threshold_policy / render_manual / render_model_registry
 
 ---
 
-## 5. 설계 결정과 이유
+## 5. 오토인코더 이론과 수식
+
+코드가 **무엇을 계산하는지** 수식으로 정리하고, 각 수식이 어느 코드에 대응하는지 표시합니다.
+
+### 5.1 오토인코더의 정의
+
+오토인코더는 **인코더** $f_\theta$ 와 **디코더** $g_\phi$ 로 이루어진 신경망입니다.
+
+$$z = f_\theta(x), \qquad \hat{x} = g_\phi(z) = g_\phi(f_\theta(x))$$
+
+- $x \in \mathbb{R}^d$ : 입력 (센서 $d$개의 한 시점 값)
+- $z \in \mathbb{R}^k$ : **잠재 표현(latent)**, $k \ll d$ ← 이 $k$가 **병목(bottleneck)**
+- $\hat{x} \in \mathbb{R}^d$ : 복원값
+
+목표는 **자기 자신을 복원**하는 것입니다. 학습 손실은 평균제곱오차(MSE):
+
+$$\mathcal{L}(\theta,\phi) = \frac{1}{N}\sum_{i=1}^{N} \lVert x_i - g_\phi(f_\theta(x_i)) \rVert_2^2$$
+
+> **코드**: `src/model.py: build_autoencoder()` 가 $f,g$ 구조를 만들고,
+> `src/train.py` 의 `model.compile(loss="mse")` + `model.fit(fit_x, fit_x)` 가 위 손실을 최소화합니다.
+> `fit(x, x)` 처럼 **입력과 정답이 같은 것**이 오토인코더의 특징입니다.
+
+이 프로젝트의 기본 구조 (`config/default.yaml`: `hidden_layers=[32,16]`, `bottleneck=8`):
+
+```
+x(d=5) → Dense32 → Dense16 → Dense8(z) → Dense16 → Dense32 → x̂(5)
+         └────── encoder f ──────┘      └────── decoder g ──────┘
+```
+
+### 5.2 왜 이것이 이상 탐지가 되는가
+
+핵심은 **병목이 정보를 통과시키지 못한다**는 점입니다. $k < d$ 이므로 AE는 입력을 그대로
+복사할 수 없고, **정상 데이터에서 반복되는 구조**(센서 간 상관, 전형적 범위)만 압축해 학습합니다.
+
+기하학적으로 보면, AE는 정상 데이터가 놓인 **저차원 다양체(manifold)** $\mathcal{M}$ 를 근사하고,
+복원은 그 위로의 **사영(projection)** 과 비슷하게 동작합니다.
+
+$$\hat{x} \approx \text{proj}_{\mathcal{M}}(x)$$
+
+- 정상 $x$ 는 이미 $\mathcal{M}$ 위에 있으므로 $\lVert x-\hat{x}\rVert$ 이 작습니다.
+- 이상 $x$ 는 $\mathcal{M}$ 에서 떨어져 있어 사영 거리가 크고 → 오차가 큽니다.
+
+즉 재구성 오차는 **"정상 패턴으로부터의 거리"** 를 근사한 값입니다.
+고장을 배운 적이 없어도 탐지가 되는 이유가 여기 있습니다.
+
+### 5.3 재구성 오차와 판정
+
+**샘플별 오차** (피처 방향 평균):
+
+$$e_i = \frac{1}{d}\sum_{j=1}^{d}\left(x_{ij} - \hat{x}_{ij}\right)^2$$
+
+**피처별 오차** (원인 진단용):
+
+$$e_{ij} = \left(x_{ij} - \hat{x}_{ij}\right)^2$$
+
+**판정**: $\hat{y}_i = \mathbb{1}[\, e_i \ge \tau \,]$ , **이상 점수** $= e_i / \tau$ (1을 넘으면 이상)
+
+> **코드**: `src/scoring.py: reconstruction_error()` = $e_i$,
+> `per_feature_squared_error()` = $e_{ij}$, 판정은 `src/detector.py: predict()`.
+> 화면의 "피처별 기여도" 막대가 $e_{ij}$ 를 정렬한 것입니다.
+
+### 5.4 임계값 $\tau$ 와 오경보율
+
+정상 데이터의 오차 분포를 $F_{\text{normal}}$ 이라 하면, 백분위수 방식은
+
+$$\tau = F^{-1}_{\text{normal}}(1-\alpha)$$
+
+여기서 $\alpha$ 가 **허용 오경보율(FAR)** 입니다. `percentile: 99.0` 은 $\alpha=0.01$ 을 뜻하고,
+"정상의 1%는 이상으로 오판한다"는 **설계상의 약속**입니다.
+
+$$\text{FAR}(\tau) = P(e \ge \tau \mid \text{정상}) \;\approx\; \frac{1}{N}\sum_i \mathbb{1}[e_i \ge \tau]$$
+
+> **코드**: `compute_threshold()`(산출), `threshold_for_far()`($\alpha \to \tau$ 역산),
+> `far_for_threshold()`($\tau \to \alpha$).
+
+**⚠️ 여기가 이 프로젝트에서 가장 중요한 이론적 함정입니다.**
+$F_{\text{normal}}$ 을 **학습에 사용한 데이터**로 추정하면, 모델이 그 데이터를 이미 잘 복원하므로
+$e_i$ 가 낙관적으로 작습니다. 그러면 $\tau$ 가 과소 설정되고 **실제 FAR $\gg \alpha$** 가 됩니다.
+
+$$\mathbb{E}[e \mid \text{학습에 쓴 정상}] \;<\; \mathbb{E}[e \mid \text{처음 보는 정상}]$$
+
+그래서 정상 데이터를 학습용/**보정용**으로 나누고 보정용으로만 $\tau$ 를 추정합니다
+(`threshold.calibration_split`). 실측으로 FAR이 2.9% → 1.4%로 목표 1%에 근접했습니다.
+
+**비용 기반 임계값**은 미탐/오탐 비용을 반영해 총비용을 최소화합니다:
+
+$$\tau^{*} = \arg\min_{\tau}\; \left[\, c_{FN}\cdot \text{FN}(\tau) + c_{FP}\cdot \text{FP}(\tau) \,\right]$$
+
+> **코드**: `cost_optimal_threshold()`. $c_{FN}$ 이 커지면 $\tau^{*}$ 가 낮아집니다(민감해짐).
+
+### 5.5 정규화가 필수인 이유
+
+MSE는 **스케일에 민감**합니다. rpm(≈1500)과 vibration(≈2)을 그대로 쓰면
+rpm의 오차가 손실을 지배해 진동 이상을 놓칩니다. 그래서 표준화합니다:
+
+$$\tilde{x}_{j} = \frac{x_{j}-\mu_j}{\sigma_j}$$
+
+$\mu_j, \sigma_j$ 는 **학습 정상 데이터에서만** 추정하고 저장합니다(`scaler.pkl`).
+추론에서 다시 추정하면 **데이터 누수**이며, 판정 기준이 데이터마다 달라져 일관성이 깨집니다.
+
+> **코드**: `data.fit_preprocess()`(추정+변환) / `data.validate_and_transform()`(변환만).
+
+### 5.6 병목 크기의 trade-off
+
+| 병목 $k$ | 결과 |
+|---|---|
+| 너무 작음 | 정상조차 복원 못 함 → 정상 오차↑ → **오경보 증가** |
+| 적정 | 정상만 잘 복원, 이상은 복원 실패 → **분리 최대** |
+| 너무 큼 | 항등함수 $g\circ f \approx I$ 에 가까워져 **이상까지 복원** → 탐지 실패 |
+
+$k \ge d$ 이면 이론적으로 완전한 항등 사상이 가능해 탐지 능력이 사라집니다.
+정규화(L2·Dropout)는 이를 완화하는 보조 수단입니다.
+
+> **코드**: `config/default.yaml: model.bottleneck`, 화면의 "병목 차원" 설정.
+
+### 5.7 LSTM 오토인코더 (시계열)
+
+행 단위 AE는 각 시점을 **독립적으로** 봅니다. 값이 시간에 걸쳐 이어지는 데이터에서는
+"값 자체는 정상 범위인데 **변화 패턴**이 이상한" 경우를 놓칩니다.
+
+LSTM-AE는 **윈도우 시퀀스**를 입력으로 받습니다.
+$X_t = (x_{t-W+1},\dots,x_t) \in \mathbb{R}^{W\times d}$
+
+$$z = \text{LSTM}_{enc}(X_t), \qquad \hat{X}_t = \text{LSTM}_{dec}(\text{RepeatVector}_W(z))$$
+
+$$e_t = \frac{1}{W d}\sum_{w=1}^{W}\sum_{j=1}^{d}\left(x_{t-W+w,j}-\hat{x}_{t-W+w,j}\right)^2$$
+
+`RepeatVector`는 하나의 잠재벡터 $z$ 를 $W$번 복제해 디코더가 시퀀스를 재생성하게 합니다.
+
+> **코드**: `src/model.py: build_lstm_autoencoder()`,
+> `src/windowing.py: make_windows()`(시퀀스 생성) / `map_windows_to_rows()`(윈도우 결과 → 행 매핑),
+> `src/scoring.py: seq_window_errors()` = 위 $e_t$.
+
+**시간 의존성 판단**은 자기상관(ACF)으로 합니다:
+
+$$\rho_k = \frac{\sum_t (x_t-\bar{x})(x_{t+k}-\bar{x})}{\sum_t (x_t-\bar{x})^2}$$
+
+피처별 $|\rho_1|$ 의 평균이 임계(0.3) 이상이면 LSTM을 권장합니다.
+> **코드**: `src/eda.py: time_dependency()`
+
+### 5.8 드리프트 판정 수식
+
+**z-score** — 평균 이동:
+$$z = \frac{\bar{e}_{\text{현재}} - \mu_{\text{기준}}}{\sigma_{\text{기준}}}$$
+
+**PSI** (Population Stability Index) — 분포 이동. 기준 분포의 분위수로 $B$개 구간을 나눈 뒤,
+$$\text{PSI} = \sum_{b=1}^{B}\left(a_b - e_b\right)\ln\frac{a_b}{e_b}$$
+($e_b$: 기준 비율, $a_b$: 현재 비율). 0.1↑ 주의, 0.25↑ 경고가 통용되는 기준입니다.
+
+**KS 검정** — 두 경험적 분포함수의 최대 거리:
+$$D = \sup_x \left| F_{\text{기준}}(x) - F_{\text{현재}}(x) \right|$$
+$p<0.05$ 이면 "분포가 다르다"고 판단합니다.
+
+> **코드**: `src/monitoring.py: assess_drift()` / `psi()` / `ks_stat()`
+
+### 5.9 평가지표 수식
+
+$$\text{Precision}=\frac{TP}{TP+FP},\quad \text{Recall}=\frac{TP}{TP+FN},\quad
+F_1 = 2\cdot\frac{P\cdot R}{P+R}$$
+
+불균형 데이터에서 정확도 $\frac{TP+TN}{N}$ 는 무의미합니다(이상 1%면 전부 정상이라 해도 99%).
+**PR-AUC**(=Average Precision)가 더 신뢰할 만합니다.
+
+**에피소드 지표** — 연속 이상 구간 $E=[s,e]$ 에 대해
+- 검출: $\exists\, t\in E,\ \hat{y}_t=1$
+- 지연: $\min\{t\in E:\hat{y}_t=1\} - s$
+
+> **코드**: `src/evaluate.py`(표준), `src/protocol.py: episode_metrics()`(에피소드·지연)
+
+### 5.10 이 방식의 이론적 한계
+
+- **다봉 정상**: 정상이 여러 운전 모드로 나뉘면 단일 다양체 가정이 깨집니다.
+  → 모드별 모델 또는 모드를 피처로 투입.
+- **일반화의 역설**: AE가 너무 잘 일반화하면 **처음 보는 이상도 복원**해버립니다(병목 문제와 동일).
+- **미세 이상**: $\lVert x-\text{proj}_\mathcal{M}(x)\rVert$ 이 정상 오차 분포와 겹치면
+  임계값으로 분리할 수 없습니다. (실측: 난이도 '미세'에서 F1 0.73)
+- **오차는 방향을 모른다**: $e_i$ 는 크기만 알려주므로 "어떤 고장인지"는 판단하지 못합니다.
+
+---
+
+## 6. Streamlit 동작 방식 (화면 코드를 읽기 위한 배경)
+
+`app/app.py`를 읽을 때 **Streamlit의 실행 모델**을 모르면 코드가 이상해 보입니다.
+꼭 알아야 할 것만 정리합니다.
+
+### 6.1 실행 모델 — "스크립트가 통째로 다시 실행된다"
+
+일반 웹 프레임워크와 달리 Streamlit에는 이벤트 핸들러가 없습니다.
+**위젯을 건드릴 때마다 `app.py`가 처음부터 끝까지 다시 실행**됩니다(rerun).
+
+```
+사용자가 슬라이더 이동
+   → app.py 전체 재실행 (import부터 다시)
+   → st.slider(...) 가 '새 값'을 반환
+   → 그 값으로 아래 코드가 다시 그려짐
+```
+
+그래서 이런 코드가 성립합니다:
+```python
+thr = st.slider("판정 임계값", ...)   # 매 실행마다 현재 값을 "읽어오는" 것
+result = detector.predict(df, threshold=thr)   # 그 값으로 다시 계산
+```
+**버튼도 마찬가지**입니다. `st.button()`은 "눌렸는가"를 **그 실행에서만** True로 반환합니다.
+다음 rerun에서는 다시 False가 됩니다.
+
+```python
+if st.button("🚀 학습 시작"):    # 누른 그 순간의 실행에서만 True
+    ...
+```
+
+### 6.2 `st.session_state` — 재실행을 넘어 값을 유지
+
+스크립트가 매번 재실행되므로 **일반 변수는 사라집니다.** 유지하려면 `session_state`에 넣습니다.
+브라우저 탭(세션)마다 독립적입니다.
+
+이 프로젝트에서 실제로 쓰는 키:
+
+| 키 | 용도 |
+|---|---|
+| `data_df` / `data_name` | EDA에서 준비한 데이터(메뉴를 옮겨도 유지) |
+| `active_model_dir` / `model_select` | 현재 선택된 모델 경로 |
+| `eda_ran` | EDA를 실행했는지(버튼 상태 기억) |
+| `pending_train` | 학습 예약 — 팝업에서 선택한 모델 타입/윈도우 |
+| `cmp_result` / `tsplit` | 모델 비교·시간분할 검증 결과(재실행해도 유지) |
+| `thr_slider` | 임계값 슬라이더 값(모델 바뀌면 자동 보정) |
+| `upload_sig` / `_eda_up_sig` | 업로드 파일이 바뀌었는지 감지(파일명+크기) |
+| `onboard_hide` / `train_note` | 온보딩 배너 닫기 · 학습 결과 메시지 |
+
+**위젯의 `key`도 session_state에 저장됩니다.** `st.slider(..., key="thr_slider")`로 만들면
+`st.session_state["thr_slider"]`로 읽고 **쓸 수도** 있습니다.
+
+```python
+# 추천 임계값을 슬라이더에 반영하는 실제 코드 패턴
+st.session_state["thr_slider"] = float(rec["threshold"])
+st.rerun()      # 즉시 다시 그려서 반영
+```
+
+> ⚠️ `key`를 가진 위젯은 같은 `key`가 화면에 두 번 있으면 **DuplicateWidgetID 오류**가 납니다.
+> 그래서 모델 편집 UI는 `key=f"edit_name_{mid}"`처럼 **모델 ID를 붙여** 유일성을 확보합니다.
+
+### 6.3 `st.rerun()` — 즉시 재실행
+
+상태를 바꾼 뒤 화면을 곧바로 갱신하려면 호출합니다(이 프로젝트에 9곳).
+호출하면 그 지점에서 **실행이 중단되고** 처음부터 다시 시작합니다.
+
+전형적 사용처: 모델 삭제 후 목록 갱신, 학습 완료 후 활성 모델 전환, 팝업 선택 반영.
+
+### 6.4 캐시 — `cache_data` vs `cache_resource`
+
+매번 재실행되므로 무거운 작업은 반드시 캐시해야 합니다.
+
+| 데코레이터 | 대상 | 동작 | 이 프로젝트 사용처 |
+|---|---|---|---|
+| `@st.cache_resource` | 모델·커넥션 등 **공유 객체** | 원본 객체를 그대로 재사용 | `get_detector()` — TF 모델 로드(수 초) |
+| `@st.cache_data` | DataFrame·문자열 등 **데이터** | 복사본 반환(변경해도 안전) | `_model_features()`, `_load_guide()` |
+
+**캐시 키는 함수 인자**입니다. 그래서 파일 갱신을 반영하려면 mtime을 인자로 넘깁니다:
+
+```python
+@st.cache_data(show_spinner=False)
+def _model_features(path: str, _mtime: float):   # mtime이 바뀌면 캐시 무효화
+    return load_schema(path).feature_columns
+```
+> 인자 이름 앞의 `_`는 "해시하지 말라"는 뜻이 아니라 여기서는 단순 관례입니다.
+> (Streamlit에서 `_`로 시작하는 인자는 **해시 대상에서 제외**되므로 주의해서 사용하세요.)
+
+### 6.5 팝업(`st.dialog`)과 "예약" 패턴
+
+`@st.dialog`로 만든 함수를 호출하면 모달이 뜹니다. 하지만 **모달 안에서 바로 학습을 시작하면
+안 됩니다** — 모달이 닫히면서 실행이 끊길 수 있고, 진행률 표시도 모달에 갇힙니다.
+
+그래서 이 프로젝트는 **예약 → 재실행 → 본문에서 실행** 패턴을 씁니다:
+
+```python
+@st.dialog("⏱️ 시계열 윈도우 모델 선택")
+def ts_dialog(default_window):
+    ...
+    if st.button("이 설정으로 학습 시작"):
+        st.session_state["pending_train"] = {"model_type": ..., "window": ...}  # 예약만
+        st.rerun()                                                              # 모달 닫고 재실행
+
+# 본문(page_train)에서
+pend = st.session_state.pop("pending_train", None)
+if pend:
+    train_and_store(...)      # 여기서 실제 학습 + 진행률 표시
+```
+
+### 6.6 진행률 바 — Keras 콜백과 연결
+
+학습은 `src/train.py`에서 돌지만 진행률은 화면에 그려야 합니다.
+`src`가 Streamlit을 모르므로, **콜백을 주입**해 연결합니다.
+
+```python
+bar = st.progress(0.0, text="학습 준비 중...")
+
+class _P(keras.callbacks.Callback):          # app 쪽에서 정의
+    def on_epoch_end(self, epoch, logs=None):
+        bar.progress((epoch+1)/epochs, text=f"학습 중... {epoch+1}/{epochs} epoch ...")
+
+train_from_dataframe(..., extra_callbacks=[_P()])   # src는 콜백만 받아 넘김
+```
+> 이것이 "`src`는 UI를 모른다" 원칙을 지키면서도 화면과 연동하는 방법입니다.
+
+### 6.7 파일 업로더
+
+`st.file_uploader()`는 업로드된 파일 객체를 **재실행마다 계속 반환**합니다.
+그래서 "새로 올렸는지"를 직접 판별해야 중복 처리를 막습니다:
+
+```python
+sig = (up.name, up.size)
+if st.session_state.get("_eda_up_sig") != sig:   # 파일이 바뀐 경우에만
+    st.session_state["_eda_up_sig"] = sig
+    _set_data(pd.read_csv(up), up.name)
+```
+> ⚠️ 한 페이지에 업로더가 여러 개면 DOM 순서가 헷갈립니다.
+> (테스트 코드에서 `input[type=file]`을 `.last`로 지정하는 이유)
+
+### 6.8 레이아웃 API (이 프로젝트에서 쓰는 것)
+
+| API | 용도 | 사용처 |
+|---|---|---|
+| `st.sidebar` | 좌측 메뉴 | 메뉴 라디오·진행 상태 |
+| `st.columns([3,1])` | 가로 분할(비율) | KPI·컨트롤 배치 |
+| `st.tabs([...])` | 탭 | 도움말 7탭, EDA 업로드/생성 |
+| `st.expander()` | 접이식 | 학습 설정, 상세 표 |
+| `st.container(border=True, height=..)` | 테두리·내부 스크롤 박스 | 결과 프레임 |
+| `st.metric(label, value, delta)` | 큰 숫자 지표 | F1·드리프트 상태 등 |
+| `st.data_editor()` | 편집 가능한 표 | 다중행 수동 판정 |
+| `st.plotly_chart(fig, use_container_width=True)` | 차트 | 전 화면 |
+
+### 6.9 흔한 함정과 이 프로젝트의 대응
+
+| 함정 | 증상 | 대응 |
+|---|---|---|
+| 슬라이더 범위 밖 값이 session_state에 남음 | 모델 바꾸면 예외 발생 | `render_results()`에서 범위 벗어나면 기본값으로 자동 보정 |
+| 매 재실행마다 모델 로드 | 화면이 느려짐 | `@st.cache_resource`로 캐시 |
+| 같은 `key` 중복 | DuplicateWidgetID 오류 | 모델 ID 등 접두어로 유일화 |
+| 무거운 계산이 반복 실행 | 조작할 때마다 느림 | 결과를 `session_state`에 저장(`cmp_result`, `tsplit`) |
+| 큰 DataFrame을 통째로 플롯 | 렌더링 지연 | `eda.sample_for_plot()`으로 5000행 다운샘플 |
+
+### 6.10 디버깅 팁
+
+```bash
+streamlit run app/app.py --logger.level=debug     # 상세 로그
+```
+- 화면에 값 찍기: `st.write(변수)` (dict·DataFrame도 예쁘게 출력)
+- 현재 상태 확인: `st.write(st.session_state)`
+- **로직 버그는 UI 없이 잡는 게 빠릅니다** — `src`는 독립적이므로
+  7장의 스니펫처럼 파이썬으로 직접 호출해 확인하세요.
+- 코드 저장 시 우상단 **Rerun** 또는 `Always rerun` 설정으로 자동 반영됩니다.
+
+---
+
+## 7. 설계 결정과 이유
 
 코드를 읽다가 "왜 이렇게 했지?" 싶은 부분들입니다.
 
@@ -409,7 +766,7 @@ render_threshold_policy / render_manual / render_model_registry
 
 ---
 
-## 6. 확장 가이드
+## 8. 확장 가이드
 
 ### 새 드리프트 판정 방식 추가
 1. `src/monitoring.py`에 계산 함수 작성 (예: `wasserstein(...)`)
@@ -438,7 +795,7 @@ render_threshold_policy / render_manual / render_model_registry
 
 ---
 
-## 7. 개발·테스트
+## 9. 개발·테스트
 
 ```bash
 pip install -r requirements.txt          # 기본
@@ -473,7 +830,7 @@ print(compute_metrics(df["label"].values, res.errors, res.predictions))
 
 ---
 
-## 8. 관련 문서
+## 10. 관련 문서
 
 | 문서 | 내용 |
 |---|---|
