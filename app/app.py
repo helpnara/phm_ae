@@ -920,6 +920,7 @@ MENU_TRAIN = "🛠 2. 모델 생성"
 MENU_EVAL = "📊 3. 모델 평가"
 MENU_MON = "📈 4. 성능 모니터링"
 MENU_HELP = "📚 도움말"
+MENU_CODE = "🧩 코드 가이드"
 
 
 def _model_label(m: dict) -> str:
@@ -1444,7 +1445,8 @@ def main():
     # ---- 좌측: 메뉴 내비게이터(만) ----
     with st.sidebar:
         st.header("메뉴")
-        page = st.radio("메뉴", [MENU_EDA, MENU_TRAIN, MENU_EVAL, MENU_MON, MENU_HELP],
+        page = st.radio("메뉴", [MENU_EDA, MENU_TRAIN, MENU_EVAL, MENU_MON,
+                                 MENU_HELP, MENU_CODE],
                         label_visibility="collapsed", key="menu")
         st.divider()
         st.markdown("**진행 상태**")
@@ -1477,9 +1479,12 @@ def main():
         page_eval(cfg, models_dir, label_col)
     elif page == MENU_MON:
         page_monitor(cfg, models_dir, label_col)
-    else:
+    elif page == MENU_HELP:
         from help_page import render_help
         render_help()
+    else:
+        from code_page import render_code_guide
+        render_code_guide()
 
 
 if __name__ == "__main__":

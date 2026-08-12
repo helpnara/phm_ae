@@ -13,6 +13,7 @@
 | **3. 모델 평가** | **🕐 시간분할 검증**(과거 학습→미래 평가, 에피소드 검출률·탐지 지연) · 단일 샘플 판정(다중행 가능) · 테스트셋 평가 · **모델 비교** · **🎚 임계값 정책**(오경보 예산 역산·비용 최적화) |
 | **4. 성능 모니터링** | 운영 데이터 **드리프트 감지**(z-score/PSI/KS) · 구간별 오차·이상률 추이 · **알람 디바운싱(K/M)** · 기간 필터 · 재학습 권고 |
 | **📚 도움말** | 개념·데이터 준비 기준·용어 사전·결과 해석·**현업 적용 절차**·문제 해결·한계 (앱 내 가이드) |
+| **🧩 코드 가이드** | 아키텍처·실행 흐름·모듈 API·설계 이유·확장 방법 (`docs/CODE_GUIDE.md` 렌더링) |
 
 부가 기능: **모델 레지스트리**(저장·선택·이름/메모/태그·F1 정렬·태그 필터·zip 이관),
 결과 CSV·**HTML 리포트**·아티팩트 zip 다운로드, 다중 CSV 배치 판정.
@@ -50,7 +51,7 @@
 - 변경 이력: [`CHANGELOG.md`](CHANGELOG.md) · 향후 계획: [`ROADMAP.md`](ROADMAP.md)
 - 요구사항 정의서: [`docs/requirements.md`](docs/requirements.md)
 - 사내 서버·DB 이식 노트: [`docs/migration_notes.md`](docs/migration_notes.md)
-- 개발 가이드: [`CLAUDE.md`](CLAUDE.md)
+- 개발 가이드: [`CLAUDE.md`](CLAUDE.md) · **코드 구조 문서**: [`docs/CODE_GUIDE.md`](docs/CODE_GUIDE.md)
 
 ## 빠른 시작
 
