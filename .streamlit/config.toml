@@ -1,0 +1,13 @@
+# Streamlit 실행/배포 설정.
+# 비밀정보(접속키 등)는 여기에 넣지 말고 .streamlit/secrets.toml(gitignore됨) 사용.
+
+[server]
+headless = true
+# 포트는 배포 호스트(Streamlit Cloud 등)가 지정하므로 하드코딩하지 않는다.
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#2c7fb8"          # 정상 데이터 색과 통일(위젯/슬라이더 강조색)

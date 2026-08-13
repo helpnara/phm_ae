@@ -1,0 +1,23 @@
+# 데이터 / 아티팩트 / 모델 레지스트리 (대용량, 재현 가능)
+data/
+artifacts/
+models/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / 에디터
+.DS_Store
+.idea/
+.vscode/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# 시크릿 / 접속정보 (실값 커밋 금지, .env.example만 커밋)
+.env

@@ -1,0 +1,55 @@
+# PHM 오토인코더 이상탐지 설정 파일
+# 모든 값은 학습/추론 시 이 파일에서 읽는다. 하드코딩 금지.
+
+seed: 42
+
+data:
+  # 피처에서 제외할 컬럼(존재할 경우). 시간/라벨/식별자 등.
+  exclude_columns: ["timestamp", "label", "id"]
+  # 라벨 컬럼명(선택). 존재하면 평가(FR-7)에 사용. 0=정상, 1=이상.
+  label_column: "label"
+  # 시간 컬럼명(선택). 존재하면 시각화 x축에 사용.
+  timestamp_column: "timestamp"
+  # 결측 대치: median | mean | drop
+  impute_strategy: "median"
+  # 분산 0(상수) 컬럼 제거 여부
+  drop_constant_columns: true
+
+model:
+  # 인코더 은닉층 크기(병목 이전). 디코더는 대칭으로 자동 구성.
+  hidden_layers: [32, 16]
+  bottleneck: 8
+  activation: "relu"
+  dropout: 0.0
+  l2: 0.0
+
+train:
+  validation_split: 0.1
+  epochs: 100
+  batch_size: 64
+  learning_rate: 0.001
+  early_stopping_patience: 10
+
+threshold:
+  # percentile: 정상 재구성 오차의 백분위수 / mean_std: mean + k*std
+  method: "percentile"
+  percentile: 99.0
+  k_std: 3.0
+  # 임계값 보정용으로 떼어둘 정상 데이터 비율(학습에 사용하지 않음).
+  # 0으로 두면 학습 데이터에서 임계값을 산출(낙관적 편향 → 오경보 증가) — 권장하지 않음.
+  calibration_split: 0.2
+
+paths:
+  artifacts_dir: "artifacts"
+  # 학습된 모델 레지스트리(영구 저장). 웹앱이 과거 모델을 목록·선택하는 위치.
+  models_dir: "models"
+
+# 사내 DB(Oracle) 연동 설정 (선택). 로컬/합성 테스트에는 사용 안 함.
+# 접속정보(계정/비번/DSN)는 여기에 넣지 말고 환경변수로 주입한다:
+#   PHM_DB_USER, PHM_DB_PASSWORD, PHM_DB_DSN  (docs/migration_notes.md §1~2 참고)
+database:
+  enabled: false
+  # 정상 데이터 조회 쿼리(학습용). 실제 테이블/컬럼명에 맞게 수정.
+  normal_query: "SELECT * FROM PHM_SENSOR WHERE STATUS = 'NORMAL'"
+  # 배치 추론 결과 적재 테이블
+  result_table: "PHM_ANOMALY_RESULT"
