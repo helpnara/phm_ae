@@ -52,6 +52,7 @@
 - 요구사항 정의서: [`docs/requirements.md`](docs/requirements.md)
 - 사내 서버·DB 이식 노트: [`docs/migration_notes.md`](docs/migration_notes.md)
 - 개발 가이드: [`CLAUDE.md`](CLAUDE.md) · **코드 구조 문서**: [`docs/CODE_GUIDE.md`](docs/CODE_GUIDE.md)
+- 개발 회고(시행착오 정리, 다음 앱용): [`docs/LESSONS_LEARNED.md`](docs/LESSONS_LEARNED.md)
 
 ## 빠른 시작
 
